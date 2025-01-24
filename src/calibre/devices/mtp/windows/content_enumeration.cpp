@@ -346,11 +346,10 @@ find_objects_in(CComPtr<IPortableDeviceContent> &content, CComPtr<IPortableDevic
     }
 
     hr = S_OK;
-
+    generic_raii_array<wchar_t*, co_task_mem_free, 16> child_ids;
     while (hr == S_OK) {
 		DWORD fetched;
 		prop_variant pv(VT_LPWSTR);
-		generic_raii_array<wchar_t*, co_task_mem_free, 16> child_ids;
         Py_BEGIN_ALLOW_THREADS;
         hr = children->Next((ULONG)child_ids.size(), child_ids.ptr(), &fetched);
         Py_END_ALLOW_THREADS;
