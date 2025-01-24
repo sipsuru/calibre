@@ -332,7 +332,7 @@ find_objects_in(CComPtr<IPortableDeviceContent> &content, CComPtr<IPortableDevic
     Py_END_ALLOW_THREADS;
 
     if (FAILED(hr)) {
-        fwprintf(stderr, L"Failed to EnumObjects() for object id: %s retrying with a sleep.\n", parent_id); fflush(stderr);
+        fwprintf(stderr, L"Failed to EnumObjects() for object id: %s with hr: %x retrying with a sleep.\n", parent_id, hr); fflush(stderr);
         Py_BEGIN_ALLOW_THREADS;
         Sleep(500);
         hr = content->EnumObjects(0, parent_id, NULL, &children);
@@ -345,11 +345,11 @@ find_objects_in(CComPtr<IPortableDeviceContent> &content, CComPtr<IPortableDevic
         }
     }
 
-    hr = S_OK;
     generic_raii_array<wchar_t*, co_task_mem_free, 16> child_ids;
+    prop_variant pv(VT_LPWSTR);
+    DWORD fetched;
+    hr = S_OK;
     while (hr == S_OK) {
-		DWORD fetched;
-		prop_variant pv(VT_LPWSTR);
         Py_BEGIN_ALLOW_THREADS;
         hr = children->Next((ULONG)child_ids.size(), child_ids.ptr(), &fetched);
         Py_END_ALLOW_THREADS;
