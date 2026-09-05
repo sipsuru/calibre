@@ -630,7 +630,7 @@ def create_global_prefs(conf_obj=None):
     c.add_opt(
         'add_new_book_tags_when_importing_books',
         default=False,
-        help=_('Apply the tags to apply to books added to the library when copying books to another library as well'),
+        help=_('Make the tags to apply to books added to the library also apply when copying books to another library'),
     )
     c.add_opt(
         'mark_new_books',
