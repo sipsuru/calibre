@@ -18,7 +18,7 @@ from functools import partial
 from html import escape
 from itertools import count
 from threading import Thread
-from time import localtime, strftime
+from time import localtime, monotonic, strftime
 from typing import NamedTuple
 
 from qt.core import (
@@ -831,6 +831,10 @@ class GameWidget(QWidget):
         self.turn_timer.setSingleShot(True)
         self.turn_timer.setInterval(5 * 60 * 1000)  # 5 minute timeout
         self.turn_timer.timeout.connect(self.on_turn_timeout)
+        self._thinking_start: float = 0.0
+        self._thinking_ticker = QTimer(self)
+        self._thinking_ticker.setInterval(1000)
+        self._thinking_ticker.timeout.connect(self._update_thinking_elapsed)
         self.image_counter = count(start=1)
         self.image_call = -1
         self.image_turn = -1
@@ -909,7 +913,7 @@ class GameWidget(QWidget):
         ib.clicked.connect(self.interesting_event)
         h.addWidget(ib), h.addStretch()
         il.addLayout(h)
-        self.input_stack = ws = WaitStack(_('Thinking, please wait…'), after=input_panel, parent=left, size=64)
+        self.input_stack = ws = WaitStack(_('Thinking…'), after=input_panel, parent=left, size=64)
         ws.stop()
         ll.addWidget(ws)
         sp.addWidget(left)
@@ -1037,6 +1041,19 @@ class GameWidget(QWidget):
         elif self.images_enabled and len(state.turns) not in self.images:
             self.request_image(len(state.turns))
 
+    def _update_thinking_elapsed(self) -> None:
+        secs = int(monotonic() - self._thinking_start)
+        if secs < 60:
+            human = ngettext('{} second', '{} seconds', secs).format(secs)
+        else:
+            mins, s = divmod(secs, 60)
+            human = _('{m}m {s}s').format(m=mins, s=s)
+        self.input_stack.msg = _('Thinking… {}').format(human)
+
+    def _stop_thinking(self) -> None:
+        self._thinking_ticker.stop()
+        self.input_stack.stop()
+
     def cancel_pending_ai_calls(self) -> None:
         # In-flight generations keep running but their results are discarded
         # as their call numbers no longer match.
@@ -1045,7 +1062,7 @@ class GameWidget(QWidget):
         self.turn_timer.stop()
         self.image_call = -1
         self.image_turn = -1
-        self.input_stack.stop()
+        self._stop_thinking()
 
     def refresh_ui(self) -> None:
         self.render_story()
@@ -1397,7 +1414,7 @@ class GameWidget(QWidget):
         turn_request = self.turn_request
         self.turn_call = -1
         self.turn_request = None
-        self.input_stack.stop()
+        self._stop_thinking()
         d = error_dialog(
             self,
             _('AI response timed out'),
@@ -1429,7 +1446,10 @@ class GameWidget(QWidget):
         snapshot = deserialize_game(serialize_game(self.state))
         self.turn_call = next(self.turn_counter)
         self.turn_request = (player_input, interesting_event)
+        self._thinking_start = monotonic()
+        self.input_stack.msg = _('Thinking…')
         self.input_stack.start()
+        self._thinking_ticker.start()
         self.turn_timer.start()
         Thread(name='CYOATurn', daemon=True, target=self.do_turn, args=(snapshot, player_input, interesting_event, self.turn_call, plugin)).start()
 
@@ -1451,7 +1471,7 @@ class GameWidget(QWidget):
         turn_request = self.turn_request
         self.turn_call = -1
         self.turn_request = None
-        self.input_stack.stop()
+        self._stop_thinking()
         if res.exception is not None:
             d = error_dialog(
                 self,
