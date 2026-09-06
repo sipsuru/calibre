@@ -45,7 +45,26 @@ METADATA_FILE_NAME = 'metadata.json'
 VERSION_PAT = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]*')
 
 CAMOUFOX_REPO = 'daijro/camoufox'
-GITHUB_HEADERS = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+
+
+def github_api_headers() -> dict[str, str]:
+    """The headers to use for requests to the GitHub REST API.
+
+    Unauthenticated requests are rate limited to sixty an hour per source IP address
+    and CI runners share their addresses with the rest of the world, so the limit is
+    routinely exhausted by unrelated jobs, causing 403 errors. Authenticating with the
+    token GitHub Actions provides raises the limit to a thousand an hour per repository.
+    This is restricted to CI so that calibre never sends a user's credentials anywhere.
+
+    These headers must not be used for release asset downloads, as those redirect to a
+    CDN which both would be sent the Authorization header and rejects requests carrying
+    one.
+    """
+    ans = {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+    if os.environ.get('CI', '').lower() == 'true' and (token := os.environ.get('GITHUB_TOKEN')):
+        ans['Authorization'] = f'Bearer {token}'
+    return ans
+
 
 BROWSERFORGE_DATA_PACKAGE = 'apify_fingerprint_datapoints'
 # Maps the name of the function used to get a data file in the
@@ -431,7 +450,7 @@ class Camoufox(Installer):
 
     def latest_release(self, allow_prerelease: bool = False, **kw: Any) -> Release:  # noqa: ANN401
         pat = camoufox_asset_pattern()
-        releases = download_json(f'https://api.github.com/repos/{CAMOUFOX_REPO}/releases?per_page=50', GITHUB_HEADERS)
+        releases = download_json(f'https://api.github.com/repos/{CAMOUFOX_REPO}/releases?per_page=50', github_api_headers())
         ans: Release | None = None
         ans_key: tuple[int, ...] = ()
         for release in releases:

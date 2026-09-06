@@ -24,6 +24,10 @@ class BrowserDeps(Command):
             try:
                 return func(*a, **kw)
             except Exception as err:
+                # A 403 means a rate limit or an authorization failure, neither of
+                # which will resolve itself in the few seconds we would wait
+                if getattr(err, 'code', -1) == 403:
+                    raise
                 if attempt >= self.num_attempts - 1:
                     raise
                 self.info(f'Download failed with error: {err}, retrying...')
