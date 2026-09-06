@@ -307,8 +307,31 @@ class TestCamoufoxFonts(unittest.TestCase):
         # The second call must come from the on disk cache and agree
         self.assertEqual(families, camoufox.font_families(resource_dir, install[1], 'linux'))
 
-    @unittest.skipIf(installed_camoufox() is None, 'the camoufox browser is not installed')
     def test_fontconfig_generation(self) -> None:
+        # Only the Linux camoufox bundle ships the fontconfig directories, as
+        # it is the only platform on which the browser needs to be told where
+        # its bundled fonts are, so use a fake resource dir, which also means
+        # this test runs even without the browser installed.
+        for dirname in ('fontconfig', 'fontconfigs'):  # renamed in camoufox v150
+            with tempfile.TemporaryDirectory(prefix='camoufox-test-') as tdir:
+                os.makedirs(os.path.join(tdir, dirname, 'windows'))
+                with open(os.path.join(tdir, dirname, 'windows', 'fonts.conf'), 'w') as f:
+                    f.write('<fontconfig><dir prefix="cwd">fonts</dir></fontconfig>')
+                version = 'test-' + os.path.basename(tdir)
+                path = camoufox.fontconfig_path(tdir, version, 'windows')
+                self.addCleanup(os.remove, path)
+                with open(path) as f:
+                    conf = f.read()
+                self.assertNotIn('prefix="cwd"', conf, 'the relative font dir was not made absolute')
+                self.assertIn(f'<dir>{os.path.join(tdir, "fonts")}</dir>', conf)
+                with self.assertRaises(camoufox.Error):  # no fonts.conf for this target OS
+                    camoufox.fontconfig_path(tdir, version, 'linux')
+
+    @unittest.skipIf(
+        installed_camoufox() is None or camoufox.current_os() != 'linux',
+        'the camoufox browser is not installed, or this is not Linux, and only the Linux bundle has fontconfig files',
+    )
+    def test_bundled_fontconfig(self) -> None:
         install = installed_camoufox()
         assert install is not None
         resource_dir = camoufox_resource_dir(install[0])
