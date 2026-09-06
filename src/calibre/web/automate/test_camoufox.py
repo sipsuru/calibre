@@ -5,7 +5,9 @@ import asyncio
 import functools
 import http.server
 import json
+import math
 import os
+import random
 import socketserver
 import struct
 import tempfile
@@ -27,6 +29,36 @@ TEST_PAGE = '''<!DOCTYPE html><html><head><title>Test Page</title></head><body>
     document.body.appendChild(d);
 }, 300);</script>
 </body></html>'''
+
+CLICK_PAGE = '''<!DOCTYPE html><html><head><title>Click Test</title><style>
+body { margin: 0; height: 4000px; }
+#btn { position: absolute; left: 40px; top: 30px; width: 120px; height: 40px; }
+#far { position: absolute; left: 60px; top: 3000px; }
+#hidden { display: none; }
+</style></head><body>
+<button id="btn">Press me</button>
+<a href="#x" id="far">far away</a>
+<span id="hidden">invisible</span>
+</body></html>'''
+
+# Installed by the tests rather than by the page itself, because scripts in the
+# page run in a different JavaScript world from the one evaluate() uses
+RECORDER_JS = '''() => {
+    window.__moves = [];
+    window.__events = [];
+    window.__reset = () => { window.__moves = []; window.__events = []; };
+    document.addEventListener('mousemove', (e) => window.__moves.push([e.clientX, e.clientY]), true);
+    for (const type of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'])
+        document.addEventListener(type, (e) => window.__events.push({
+            type: e.type, target: e.target.id, x: e.clientX, y: e.clientY, at: performance.now(),
+            button: e.button, buttons: e.buttons, detail: e.detail,
+            alt: e.altKey, ctrl: e.ctrlKey, shift: e.shiftKey, meta: e.metaKey}), true);
+}'''
+
+RECT_JS = '''(id) => {
+    const r = document.getElementById(id).getBoundingClientRect();
+    return {left: r.left, top: r.top, right: r.right, bottom: r.bottom};
+}'''
 
 TEST_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="red"/></svg>'
 
@@ -352,6 +384,8 @@ class Server:
             f.write(TEST_PAGE)
         with open(os.path.join(self.dir, 'second.html'), 'w') as f:
             f.write('<!DOCTYPE html><html><head><title>Second</title></head><body><h1>Second</h1></body></html>')
+        with open(os.path.join(self.dir, 'click.html'), 'w') as f:
+            f.write(CLICK_PAGE)
         with open(os.path.join(self.dir, 'pic.svg'), 'w') as f:
             f.write(TEST_SVG)
 
@@ -371,6 +405,92 @@ class Server:
         self.httpd.server_close()
         self.thread.join(timeout=10)
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class TestCamoufoxMouse(unittest.TestCase):
+    """Tests for generating human like cursor paths. These never touch the browser."""
+
+    def test_trajectory_shape(self) -> None:
+        start, end = (0.0, 0.0), (400.0, 300.0)
+        distance = math.hypot(*end)
+        curved = 0
+        for seed in range(24):
+            path = camoufox.human_trajectory(start, end, rng=random.Random(seed))
+            self.assertTrue(path)
+            self.assertLessEqual(len(path), camoufox.MAX_MOVE_STEPS)
+            # It must arrive exactly where it was asked to
+            self.assertEqual(path[-1][:2], end)
+            for x, y, t in path:
+                self.assertTrue(math.isfinite(x) and math.isfinite(y) and math.isfinite(t))
+            # Time must run forwards, from after the movement starts to the end of it
+            times = [t for _, _, t in path]
+            self.assertEqual(times, sorted(times))
+            self.assertGreater(times[0], 0)
+            self.assertGreaterEqual(times[-1], camoufox.MIN_MOVE_TIME)
+            self.assertLessEqual(times[-1], camoufox.MAX_MOVE_TIME)
+            # The path must bow away from the straight line rather than being a ruler edge
+            deviation = max(abs((end[0] * y - end[1] * x) / distance) for x, y, _ in path)
+            self.assertLess(deviation, distance, 'the path wandered absurdly far off course')
+            if deviation > 1:
+                curved += 1
+        self.assertEqual(curved, 24, 'some paths were straight lines')
+
+    def test_trajectory_timing(self) -> None:
+        # A movement that lands on the pixel the cursor is already on is not worth making
+        self.assertEqual(camoufox.human_trajectory((10.0, 10.0), (10.4, 9.7)), [])
+        for seed in range(8):
+            rng = random.Random(seed)
+            # Distant targets take longer to reach than close ones, but not proportionally
+            near = camoufox.human_trajectory((0.0, 0.0), (30.0, 0.0), rng=random.Random(seed))
+            far = camoufox.human_trajectory((0.0, 0.0), (1200.0, 0.0), rng=random.Random(seed))
+            self.assertLess(near[-1][2], far[-1][2])
+            self.assertLess(far[-1][2], 12 * near[-1][2])
+            # An explicit budget is honoured
+            capped = camoufox.human_trajectory((0.0, 0.0), (1200.0, 800.0), max_time=0.2, rng=rng)
+            self.assertLessEqual(capped[-1][2], 0.2)
+        # The same seed must give the same path, so that failures are reproducible
+        self.assertEqual(
+            camoufox.human_trajectory((0.0, 0.0), (100.0, 50.0), rng=random.Random(3)),
+            camoufox.human_trajectory((0.0, 0.0), (100.0, 50.0), rng=random.Random(3)),
+        )
+
+    def test_trajectory_overshoot(self) -> None:
+        def overshoots(end: tuple[float, float], seed: int) -> bool:
+            distance = math.hypot(*end)
+            path = camoufox.human_trajectory((0.0, 0.0), end, rng=random.Random(seed))
+            return max((x * end[0] + y * end[1]) / distance for x, y, _ in path) > distance + 1
+
+        # A hand shoots past a distant target sometimes and a close one never
+        self.assertTrue(any(overshoots((700.0, 500.0), seed) for seed in range(20)))
+        self.assertFalse(any(overshoots((60.0, 40.0), seed) for seed in range(20)))
+
+    def test_ease(self) -> None:
+        self.assertEqual(camoufox.ease(0.0), 0.0)
+        self.assertEqual(camoufox.ease(1.0), 1.0)
+        values = [camoufox.ease(i / 20) for i in range(21)]
+        self.assertEqual(values, sorted(values))
+        # Biased so that the cursor speeds up faster than it slows down
+        self.assertGreater(camoufox.ease(0.5), 0.5)
+
+    def test_quads(self) -> None:
+        square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+        self.assertEqual(camoufox.quad_area(square), 100)
+        self.assertEqual(camoufox.quad_area([(0.0, 0.0)] * 4), 0)
+        self.assertTrue(camoufox.quad_contains(square, (5.0, 5.0)))
+        self.assertFalse(camoufox.quad_contains(square, (11.0, 5.0)))
+        self.assertEqual(camoufox.point_to_aim_at(square), (5.0, 5.0))
+        # Whole pixels are preferred, since hit testing between them is unreliable
+        self.assertEqual(camoufox.point_to_aim_at([(0.0, 0.0), (9.4, 0.0), (9.4, 9.4), (0.0, 9.4)]), (5.0, 5.0))
+        quad = {'p1': {'x': -5, 'y': -5}, 'p2': {'x': 50, 'y': -5}, 'p3': {'x': 50, 'y': 50}, 'p4': {'x': -5, 'y': 50}}
+        self.assertEqual(camoufox.clamp_quad(quad, 20, 30), [(0.0, 0.0), (20.0, 0.0), (20.0, 30.0), (0.0, 30.0)])
+
+    def test_buttons_and_modifiers(self) -> None:
+        self.assertEqual(camoufox.mouse_button('right'), (2, 2))
+        self.assertEqual(camoufox.modifier_mask(()), 0)
+        self.assertEqual(camoufox.modifier_mask(('alt', 'shift')), 5)
+        for bad in (lambda: camoufox.mouse_button('sideways'), lambda: camoufox.modifier_mask(('hyper',))):
+            with self.assertRaises(ValueError):
+                bad()
 
 
 @unittest.skipIf(installed_camoufox() is None, 'the camoufox browser is not installed')
@@ -576,10 +696,128 @@ class TestCamoufoxBrowser(unittest.TestCase):
 
         self.run_browser(check)
 
+    def test_mouse_clicking(self) -> None:
+        base = self.server.base
+
+        async def check(browser: camoufox.Browser) -> None:
+            page = browser.page
+            await page.open(base + 'click.html')
+            await page.call(RECORDER_JS)
+            rect = await page.call(RECT_JS, 'btn')
+            # Start from the far corner so that the path to the button is a long one
+            width, height = await page.evaluate('[window.innerWidth, window.innerHeight]')
+            await page.mouse.move(width - 20, height - 20, human=False)
+            await page.evaluate('window.__reset()')
+            await page.click('#btn')
+            moves = await page.evaluate('window.__moves')
+            events = await page.evaluate('window.__events')
+            # The cursor must travel along a path rather than teleporting
+            self.assertGreater(len(moves), 5)
+            self.assertGreater(len({(round(x), round(y)) for x, y in moves}), 5)
+            # and that path must bow away from the straight line between the ends
+            (x0, y0), (x1, y1) = moves[0], moves[-1]
+            length = math.hypot(x1 - x0, y1 - y0)
+            deviation = max(abs(((x1 - x0) * (y - y0) - (y1 - y0) * (x - x0)) / length) for x, y in moves)
+            self.assertGreater(deviation, 1, 'the cursor moved in a straight line')
+            # It must end up on the button, and the page must agree it was clicked
+            self.assertEqual([e['type'] for e in events], ['mousedown', 'mouseup', 'click'])
+            self.assertEqual({e['target'] for e in events}, {'btn'})
+            self.assertAlmostEqual(page.mouse.position[0], events[-1]['x'], delta=1)
+            self.assertAlmostEqual(page.mouse.position[1], events[-1]['y'], delta=1)
+            self.assertTrue(rect['left'] <= events[-1]['x'] <= rect['right'])
+            self.assertTrue(rect['top'] <= events[-1]['y'] <= rect['bottom'])
+            # The button must be pressed for a human like length of time
+            self.assertGreater(events[1]['at'] - events[0]['at'], 30)
+            self.assertEqual((events[0]['button'], events[0]['buttons']), (0, 1))
+            self.assertEqual((events[1]['button'], events[1]['buttons']), (0, 0))
+            self.assertEqual(events[0]['detail'], 1)
+
+            # Buttons, modifiers and repeated clicks
+            await page.evaluate('window.__reset()')
+            await page.click('#btn', button='right')
+            events = await page.evaluate('window.__events')
+            self.assertEqual([e['type'] for e in events], ['mousedown', 'contextmenu', 'mouseup'])
+            self.assertEqual(events[0]['button'], 2)
+            await page.evaluate('window.__reset()')
+            await page.click('#btn', click_count=2, modifiers=('shift', 'alt'))
+            events = await page.evaluate('window.__events')
+            self.assertEqual([e['type'] for e in events], ['mousedown', 'mouseup', 'click', 'mousedown', 'mouseup', 'click', 'dblclick'])
+            self.assertEqual([e['detail'] for e in events], [1, 1, 1, 2, 2, 2, 2])
+            self.assertTrue(all(e['shift'] and e['alt'] and not e['ctrl'] for e in events))
+
+            # An element below the fold is scrolled to before being clicked
+            await page.evaluate('window.__reset()')
+            self.assertEqual(await page.evaluate('window.scrollY'), 0)
+            await page.click('#far')
+            self.assertGreater(await page.evaluate('window.scrollY'), 100)
+            events = await page.evaluate('window.__events')
+            self.assertEqual([e['target'] for e in events], ['far', 'far', 'far'])
+
+            # Moving without humanizing goes straight there
+            await page.evaluate('window.__reset()')
+            await page.mouse.move(3, 4, human=False)
+            self.assertEqual([[round(x), round(y)] for x, y in await page.evaluate('window.__moves')], [[3, 4]])
+            self.assertEqual(page.mouse.position, (3, 4))
+
+            # Hovering moves onto the element without pressing anything
+            await page.evaluate('window.__reset()')
+            await page.hover('#btn')
+            self.assertEqual(await page.evaluate('window.__events'), [])
+            self.assertEqual(await page.evaluate('document.querySelectorAll("#btn:hover").length'), 1)
+
+        self.run_browser(check)
+
+    def test_mouse_errors(self) -> None:
+        base = self.server.base
+
+        async def check(browser: camoufox.Browser) -> None:
+            page = browser.page
+            await page.open(base + 'click.html')
+            await page.call(RECORDER_JS)
+            hidden = await page.find('#hidden')
+            assert hidden is not None
+            # An element with no visible area cannot be clicked
+            with self.assertRaises(camoufox.Error):
+                await hidden.click()
+            with self.assertRaises(camoufox.TimeoutExceeded):
+                await page.click('#hidden', timeout=1)
+            with self.assertRaises(ValueError):
+                await page.click('#btn', button='sideways')
+            with self.assertRaises(ValueError):
+                await page.click('#btn', modifiers=('hyper',))
+            # A button left pressed is remembered and reported to the page
+            await page.mouse.move(50, 50)
+            await page.mouse.down()
+            self.assertEqual(page.mouse.buttons, 1)
+            await page.mouse.move(80, 70)
+            # Within a pixel, the last step of a path is skipped when it lands
+            # on the pixel the cursor is already on
+            last = await page.evaluate('window.__moves.at(-1)')
+            self.assertAlmostEqual(last[0], 80, delta=1)
+            self.assertAlmostEqual(last[1], 70, delta=1)
+            await page.mouse.up()
+            self.assertEqual(page.mouse.buttons, 0)
+
+        self.run_browser(check)
+
+    def test_clicking_with_browser_humanize(self) -> None:
+        base = self.server.base
+
+        async def check(browser: camoufox.Browser) -> None:
+            page = browser.page
+            await page.open(base + 'click.html')
+            await page.call(RECORDER_JS)
+            await page.click('#btn')
+            # The browser expanded the single movement we sent into a path
+            self.assertGreater(len(await page.evaluate('window.__moves')), 5)
+            self.assertEqual([e['type'] for e in await page.evaluate('window.__events')], ['mousedown', 'mouseup', 'click'])
+
+        self.run_browser(check, humanize=0.3)
+
 
 def find_tests() -> unittest.TestSuite:
     ans = unittest.TestSuite()
-    for cls in (TestCamoufoxConfig, TestCamoufoxTransport, TestCamoufoxFonts, TestCamoufoxBrowser):
+    for cls in (TestCamoufoxConfig, TestCamoufoxTransport, TestCamoufoxFonts, TestCamoufoxMouse, TestCamoufoxBrowser):
         ans.addTest(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
     return ans
 

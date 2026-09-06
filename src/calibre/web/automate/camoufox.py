@@ -22,6 +22,7 @@ Typical usage::
     async with Browser() as browser:
         page = browser.page
         await page.open('https://example.com')
+        await page.click('a.more')
         await page.remove('script, style')
         html = await page.html()
         img = await page.get_resource('https://example.com/logo.png')
@@ -30,6 +31,7 @@ Typical usage::
 import asyncio
 import base64
 import json
+import math
 import os
 import queue
 import random
@@ -543,8 +545,10 @@ def generate_config(
     :param fonts: the font families to report, defaults to a random subset of the
         fonts camoufox bundles for target_os
     :param locale: the locale(s) to report, the first is used for the Intl API
-    :param humanize: move the mouse cursor the way a human would, optionally
-        taking the maximum duration of a movement in seconds
+    :param humanize: have the browser itself expand every mouse movement into a
+        human like path, optionally taking the maximum duration of a movement
+        in seconds. See :class:`Mouse`, which does this in a more controllable
+        way and is what :class:`Browser` uses by default.
     :param extra: config properties that override the generated ones
     """
     target_os = check_valid_os(target_os or current_os())
@@ -1203,6 +1207,306 @@ FETCH_JS = '''async (url) => {
 # }}}
 
 
+# Human like mouse input {{{
+
+# The browser can generate humanized cursor paths itself, see the humanize
+# parameter of Browser, but it does so with a fixed ten milliseconds between
+# the points of every path, no way to vary that or skip it for an individual
+# movement, and it does nothing about the timing of the click itself. So the
+# path is generated here instead. The two cannot be combined, the browser
+# expands every single mousemove it is sent into a full path of its own, which
+# is why the browser side is used only when it has been switched on explicitly.
+
+# The number the protocol uses for each mouse button and the bit the DOM uses
+# to report that button as being held down
+MOUSE_BUTTONS = {'left': (0, 1), 'middle': (1, 4), 'right': (2, 2)}
+# The bits the protocol uses for the modifier keys
+MODIFIERS = {'alt': 1, 'control': 2, 'shift': 4, 'meta': 8}
+
+MIN_MOVE_TIME = 0.05  # seconds, the quickest a movement is ever performed
+MAX_MOVE_TIME = 0.9  # seconds, about as long as a hand takes to cross a large window
+MOVE_STEP_TIME = 0.012  # seconds between consecutive positions along a path
+MAX_MOVE_STEPS = 96  # every position along a path costs a round trip to the browser
+SETTLE_TIME = (0.02, 0.09)  # seconds the hand rests on the target before pressing
+CLICK_DWELL = (0.045, 0.125)  # seconds a button is held down for
+DOUBLE_CLICK_INTERVAL = (0.07, 0.16)  # seconds between the clicks of a multiple click
+OVERSHOOT_DISTANCE = 250.0  # pixels, a hand does not overshoot a target closer than this
+OVERSHOOT_PROBABILITY = 0.5
+
+# The source of randomness for cursor paths and click timing. Tests pass their
+# own seeded generator to human_trajectory() to get reproducible paths.
+MOTION_RNG = random.Random()
+
+
+def mouse_button(name: str) -> tuple[int, int]:
+    """The protocol's number for a mouse button and the DOM's bit for it."""
+    try:
+        return MOUSE_BUTTONS[name]
+    except KeyError:
+        raise ValueError(f'{name!r} is not a known mouse button, expected one of: {", ".join(MOUSE_BUTTONS)}')
+
+
+def modifier_mask(names: Iterable[str]) -> int:
+    """The bitmask for a collection of modifier key names."""
+    ans = 0
+    for name in names:
+        try:
+            ans |= MODIFIERS[name]
+        except KeyError:
+            raise ValueError(f'{name!r} is not a known modifier key, expected one of: {", ".join(MODIFIERS)}')
+    return ans
+
+
+def cubic_bezier(p0: tuple[float, float], p1: tuple[float, float], p2: tuple[float, float], p3: tuple[float, float], t: float) -> tuple[float, float]:
+    """The point at position t along the cubic Bezier curve with the given control points."""
+    u = 1.0 - t
+    a, b, c, d = u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t
+    return a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]
+
+
+def ease(t: float) -> float:
+    """Map progress along a path onto progress through time.
+
+    A hand does not move at a constant speed, it accelerates away from where it
+    started and slows down as it closes on its target. This is the usual
+    quintic curve for that, biased so that the acceleration is brisker than the
+    deceleration, which is what aiming at something actually looks like.
+    """
+    return (t * t * t * (t * (t * 6.0 - 15.0) + 10.0)) ** 0.85
+
+
+def curve_through(start: tuple[float, float], end: tuple[float, float], steps: int, rng: random.Random) -> list[tuple[float, float]]:
+    """steps positions along a gently bowed path from start to end.
+
+    The path is a cubic Bezier whose two control points are pushed off the
+    straight line between the ends, which is the arc a hand sweeping a mouse
+    makes. Positions are sampled with the velocity profile of :func:`ease` and
+    jittered by a pixel or so of tremor. start itself is not included and the
+    last position is exactly end.
+    """
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    distance = math.hypot(dx, dy)
+    if not distance:
+        return [end] * steps
+    ux, uy = dx / distance, dy / distance  # along the straight line
+    nx, ny = -uy, ux  # at right angles to it
+    # The further a hand travels the more it bows the path, but proportionally less
+    arc = min(0.12 * distance, 2.0 * math.sqrt(distance) + 2.0)
+    sign = rng.choice((-1.0, 1.0))
+    # Both control points are usually pushed the same way, giving a simple arc,
+    # and occasionally opposite ways, giving the gentle S a wrist sometimes makes
+    offsets = (sign * arc * rng.uniform(0.25, 1.0), sign * (-1.0 if rng.random() < 0.2 else 1.0) * arc * rng.uniform(0.25, 1.0))
+    fractions = (rng.uniform(0.15, 0.4), rng.uniform(0.6, 0.9))
+    controls = [(start[0] + ux * distance * f + nx * o, start[1] + uy * distance * f + ny * o) for f, o in zip(fractions, offsets, strict=True)]
+    tremor = min(1.5, 0.1 * math.sqrt(distance))
+    ans = []
+    for i in range(1, steps + 1):
+        t = ease(i / steps)
+        x, y = cubic_bezier(start, controls[0], controls[1], end, t)
+        # The tremor is faded out at both ends so that the movement starts and
+        # finishes exactly where it is supposed to
+        shake = tremor * math.sin(math.pi * t)
+        ans.append((x + rng.uniform(-shake, shake), y + rng.uniform(-shake, shake)))
+    ans[-1] = end
+    return ans
+
+
+def human_trajectory(
+    start: tuple[float, float], end: tuple[float, float], *, max_time: float = MAX_MOVE_TIME, rng: random.Random | None = None
+) -> list[tuple[float, float, float]]:
+    """A human like path for the cursor to follow from start to end.
+
+    Returns ``(x, y, t)`` triples, where t is the number of seconds after the
+    movement begins at which the cursor should be at ``(x, y)``. The last
+    position is always exactly end. An empty list means the cursor is already
+    close enough that nothing needs to be sent.
+
+    :param max_time: the longest the movement may take, in seconds
+    :param rng: the source of randomness, pass a seeded one for reproducible paths
+    """
+    r = MOTION_RNG if rng is None else rng
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    distance = math.hypot(dx, dy)
+    if distance < 1.0:  # the browser discards a movement within the same pixel
+        return []
+    # Fitts's law: the time taken to point at something grows with the
+    # logarithm of how far away it is rather than in proportion to it
+    duration = (0.09 + 0.075 * math.log2(distance / 12.0 + 1.0)) * r.uniform(0.8, 1.35)
+    steps = min(max(round(duration / MOVE_STEP_TIME), 2), MAX_MOVE_STEPS)
+    if distance > OVERSHOOT_DISTANCE and r.random() < OVERSHOOT_PROBABILITY:
+        # A hand moving quickly tends to shoot past a distant target and then
+        # make a second, small movement back onto it
+        amount = min(0.04 * distance, 24.0) + r.uniform(2.0, 8.0)
+        ux, uy = dx / distance, dy / distance
+        sideways = r.uniform(-0.5, 0.5) * amount
+        aim = (end[0] + ux * amount - uy * sideways, end[1] + uy * amount + ux * sideways)
+        correcting = max(2, steps // 5)
+        points = curve_through(start, aim, max(2, steps - correcting), r) + curve_through(aim, end, correcting, r)
+        duration *= 1.2  # the correction is a second movement, it takes its own time
+    else:
+        points = curve_through(start, end, steps, r)
+    duration = min(max(duration, MIN_MOVE_TIME), max_time)
+    # Pointer events do not arrive on a perfectly regular clock
+    weights = [r.uniform(0.85, 1.15) for _ in points]
+    total = sum(weights)
+    ans, elapsed = [], 0.0
+    for (x, y), weight in zip(points, weights, strict=True):
+        elapsed += weight
+        ans.append((x, y, duration * elapsed / total))
+    ans[-1] = (ans[-1][0], ans[-1][1], duration)  # the division above is not exact
+    return ans
+
+
+def quad_area(corners: Sequence[tuple[float, float]]) -> float:
+    """The area of a polygon, by the shoelace formula."""
+    ans = 0.0
+    for i, (x1, y1) in enumerate(corners):
+        x2, y2 = corners[(i + 1) % len(corners)]
+        ans += x1 * y2 - x2 * y1
+    return abs(ans) / 2.0
+
+
+def quad_contains(corners: Sequence[tuple[float, float]], point: tuple[float, float]) -> bool:
+    """Whether point lies inside the convex polygon corners."""
+    sign = 0
+    for i, (x1, y1) in enumerate(corners):
+        x2, y2 = corners[(i + 1) % len(corners)]
+        cross = (x2 - x1) * (point[1] - y1) - (y2 - y1) * (point[0] - x1)
+        if cross:
+            current = 1 if cross > 0 else -1
+            if sign and current != sign:
+                return False
+            sign = current
+    return True
+
+
+def point_to_aim_at(corners: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    """The middle of a convex polygon, preferring a whole pixel because hit
+    testing at fractional coordinates is not reliable."""
+    x = sum(corner[0] for corner in corners) / len(corners)
+    y = sum(corner[1] for corner in corners) / len(corners)
+    rounded = (float(round(x)), float(round(y)))
+    return rounded if quad_contains(corners, rounded) else (x, y)
+
+
+def clamp_quad(quad: Mapping[str, Mapping[str, float]], width: float, height: float) -> list[tuple[float, float]]:
+    """The corners of a quad from the protocol, clipped to a viewport of the given size."""
+    return [(min(max(float(p['x']), 0.0), width), min(max(float(p['y']), 0.0), height)) for p in (quad['p1'], quad['p2'], quad['p3'], quad['p4'])]
+
+
+class Mouse:
+    """Moves the cursor and clicks, the way a hand does.
+
+    Available as :attr:`Page.mouse`. Coordinates are in CSS pixels measured
+    from the top left corner of the viewport.
+    """
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        # Where the browser thinks the cursor is. It starts in the top left
+        # corner and moves only when we tell it to.
+        self.x, self.y = 0.0, 0.0
+        self.buttons = 0  # the bitmask of the buttons currently held down
+
+    def __repr__(self) -> str:
+        return f'<Mouse at ({self.x:.0f}, {self.y:.0f})>'
+
+    @property
+    def position(self) -> tuple[float, float]:
+        """Where the cursor currently is."""
+        return self.x, self.y
+
+    async def dispatch(self, event_type: str, x: float, y: float, *, button: int = 0, click_count: int = 0, modifiers: int = 0) -> None:
+        """Send a single mouse event to the page."""
+        await self.page.send(
+            'Page.dispatchMouseEvent',
+            {'type': event_type, 'x': x, 'y': y, 'button': button, 'buttons': self.buttons, 'modifiers': modifiers, 'clickCount': click_count},
+        )
+
+    async def move(self, x: float, y: float, *, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()) -> None:
+        """Move the cursor to (x, y).
+
+        :param human: follow a human like path instead of jumping straight
+            there. The default, None, means do so unless the browser has been
+            asked to humanize cursor movement itself, in which case a single
+            movement is sent and the browser expands it into a path of its own.
+        :param max_time: the longest the movement may take, in seconds
+        :param modifiers: the modifier keys to hold down, see :data:`MODIFIERS`
+        """
+        mask = modifier_mask(modifiers)
+        if human is None:
+            human = not self.page.browser.humanize
+        if human:
+            started = time.monotonic()
+            for px, py, at in human_trajectory((self.x, self.y), (x, y), max_time=max_time):
+                if (delay := started + at - time.monotonic()) > 0:
+                    await asyncio.sleep(delay)
+                # The browser discards a movement onto the pixel the cursor is
+                # already on, so there is no point paying for one
+                if round(px) != round(self.x) or round(py) != round(self.y):
+                    await self.dispatch('mousemove', px, py, modifiers=mask)
+                    self.x, self.y = px, py
+        elif round(x) != round(self.x) or round(y) != round(self.y):
+            await self.dispatch('mousemove', x, y, modifiers=mask)
+        self.x, self.y = x, y
+
+    async def down(self, button: str = 'left', *, click_count: int = 1, modifiers: Sequence[str] = ()) -> None:
+        """Press a mouse button where the cursor currently is."""
+        number, bit = mouse_button(button)
+        self.buttons |= bit
+        try:
+            await self.dispatch('mousedown', self.x, self.y, button=number, click_count=click_count, modifiers=modifier_mask(modifiers))
+        except BaseException:
+            self.buttons &= ~bit
+            raise
+
+    async def up(self, button: str = 'left', *, click_count: int = 1, modifiers: Sequence[str] = ()) -> None:
+        """Release a mouse button where the cursor currently is."""
+        number, bit = mouse_button(button)
+        self.buttons &= ~bit
+        try:
+            await self.dispatch('mouseup', self.x, self.y, button=number, click_count=click_count, modifiers=modifier_mask(modifiers))
+        except BaseException:
+            self.buttons |= bit
+            raise
+
+    async def click(
+        self,
+        x: float,
+        y: float,
+        *,
+        button: str = 'left',
+        click_count: int = 1,
+        delay: float | None = None,
+        human: bool | None = None,
+        max_time: float = MAX_MOVE_TIME,
+        modifiers: Sequence[str] = (),
+    ) -> None:
+        """Move the cursor to (x, y) and click there.
+
+        :param button: one of ``left``, ``middle`` or ``right``
+        :param click_count: 2 for a double click, 3 for a triple click
+        :param delay: how long to hold the button down for, in seconds. The
+            default, None, means a randomly chosen human like duration.
+        :param human: see :meth:`move`
+        """
+        mouse_button(button)  # fail before moving if the button name is not valid
+        if click_count < 1:
+            raise ValueError(f'{click_count} is not a valid number of clicks')
+        await self.move(x, y, human=human, max_time=max_time, modifiers=modifiers)
+        # A hand comes to rest on its target before the finger presses
+        await asyncio.sleep(MOTION_RNG.uniform(*SETTLE_TIME))
+        for i in range(click_count):
+            if i:
+                await asyncio.sleep(MOTION_RNG.uniform(*DOUBLE_CLICK_INTERVAL))
+            await self.down(button, click_count=i + 1, modifiers=modifiers)
+            await asyncio.sleep(MOTION_RNG.uniform(*CLICK_DWELL) if delay is None else delay)
+            await self.up(button, click_count=i + 1, modifiers=modifiers)
+
+
+# }}}
+
+
 class Resource(NamedTuple):
     """The bytes of something the page loaded, such as an image."""
 
@@ -1221,10 +1525,13 @@ class Element:
     def __repr__(self) -> str:
         return f'<Element {self.object_id}{" (disposed)" if self.disposed else ""}>'
 
-    async def call(self, function_declaration: str, *args: Any, by_value: bool = True) -> Any:  # noqa: ANN401
-        """Call a JavaScript function with this element as its first argument."""
+    def check_alive(self) -> None:
         if self.disposed:
             raise Error('This element handle has been disposed')
+
+    async def call(self, function_declaration: str, *args: Any, by_value: bool = True) -> Any:  # noqa: ANN401
+        """Call a JavaScript function with this element as its first argument."""
+        self.check_alive()
         return await self.page.call_with_handles(function_declaration, [{'objectId': self.object_id}, *[{'value': a} for a in args]], by_value=by_value)
 
     async def html(self) -> str:
@@ -1275,6 +1582,70 @@ class Element:
         handle = await self.call('(node, selector) => node.querySelector(selector)', css_selector, by_value=False)
         return handle
 
+    async def scroll_into_view(self) -> None:
+        """Scroll this element into the viewport, if it is not already fully visible."""
+        self.check_alive()
+        await self.page.send('Page.scrollIntoViewIfNeeded', {'frameId': self.page.main_frame, 'objectId': self.object_id})
+
+    async def clickable_point(self) -> tuple[float, float]:
+        """The coordinates of a point on this element that a click will land on.
+
+        The point is in CSS pixels measured from the top left corner of the
+        viewport. Raises :class:`Error` if the element has no visible area
+        inside the viewport, so scroll it into view first.
+        """
+        self.check_alive()
+        result = await self.page.send('Page.getContentQuads', {'frameId': self.page.main_frame, 'objectId': self.object_id})
+        width, height = await self.page.evaluate('[window.innerWidth, window.innerHeight]')
+        # An element can be laid out as several boxes, for instance a link
+        # broken across two lines, any of which is as good to click on as the
+        # bounding box of the lot, which might not even be over the element
+        quads = [corners for quad in result.get('quads') or () if quad_area(corners := clamp_quad(quad, width, height)) > 1]
+        if not quads:
+            raise Error(f'{self} has no visible area inside the viewport that can be clicked')
+        return point_to_aim_at(quads[0])
+
+    async def point_to_click(self) -> tuple[float, float]:
+        """Scroll this element into view and find a point on it to aim at.
+
+        Retried a few times because an element that has only just been scrolled
+        to, or that the page is animating, can move under the cursor.
+        """
+        for attempt in range(3):
+            if attempt:
+                await asyncio.sleep(0.05)
+            await self.scroll_into_view()
+            try:
+                return await self.clickable_point()
+            except Error:
+                if attempt == 2:
+                    raise
+        raise AssertionError('unreachable')
+
+    async def hover(self, *, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()) -> None:
+        """Move the cursor onto this element, scrolling it into view first."""
+        x, y = await self.point_to_click()
+        await self.page.mouse.move(x, y, human=human, max_time=max_time, modifiers=modifiers)
+
+    async def click(
+        self,
+        *,
+        button: str = 'left',
+        click_count: int = 1,
+        delay: float | None = None,
+        human: bool | None = None,
+        max_time: float = MAX_MOVE_TIME,
+        modifiers: Sequence[str] = (),
+    ) -> None:
+        """Click this element, scrolling it into view first.
+
+        The cursor travels to the element along a human like path and the
+        button is held down for a human like length of time, see
+        :meth:`Mouse.click` for what the parameters mean.
+        """
+        x, y = await self.point_to_click()
+        await self.page.mouse.click(x, y, button=button, click_count=click_count, delay=delay, human=human, max_time=max_time, modifiers=modifiers)
+
     async def dispose(self) -> None:
         if self.disposed:
             return
@@ -1305,6 +1676,7 @@ class Page:
         self.request_urls: dict[str, str] = {}
         self.requests_by_url: dict[str, str] = {}
         self.content_types: dict[str, str] = {}
+        self.mouse = Mouse(self)
 
     def __repr__(self) -> str:
         return f'<Page {self.target_id} {self.url}{" (closed)" if self.closed else ""}>'
@@ -1615,6 +1987,48 @@ class Page:
 
     # }}}
 
+    # Mouse input {{{
+
+    async def hover(
+        self, css_selector: str, *, timeout: float = DEFAULT_TIMEOUT, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()
+    ) -> None:
+        """Move the cursor onto the first visible element matching css_selector.
+
+        Waits for the element to appear and become visible, then scrolls it
+        into view, see :meth:`Element.hover`.
+        """
+        element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
+        try:
+            await element.hover(human=human, max_time=max_time, modifiers=modifiers)
+        finally:
+            await element.dispose()
+
+    async def click(
+        self,
+        css_selector: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        button: str = 'left',
+        click_count: int = 1,
+        delay: float | None = None,
+        human: bool | None = None,
+        max_time: float = MAX_MOVE_TIME,
+        modifiers: Sequence[str] = (),
+    ) -> None:
+        """Click the first visible element matching css_selector.
+
+        Waits for the element to appear and become visible, then scrolls it
+        into view and clicks it the way a human would, see
+        :meth:`Element.click` and :meth:`Mouse.click`.
+        """
+        element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
+        try:
+            await element.click(button=button, click_count=click_count, delay=delay, human=human, max_time=max_time, modifiers=modifiers)
+        finally:
+            await element.dispose()
+
+    # }}}
+
     # Resources {{{
 
     def resource_urls(self, pattern: str = '') -> tuple[str, ...]:
@@ -1690,7 +2104,12 @@ class Browser:
     :param locale: the locale(s) to report to pages
     :param fonts: the font families to report, defaults to a random subset of the bundled ones
     :param window: a fixed (width, height) for the window instead of a random one
-    :param humanize: move the mouse cursor the way a human would
+    :param humanize: hand the job of moving the cursor along a human like path
+        to the browser itself, instead of doing it here. The browser does it
+        with a fixed ten milliseconds between the points of a path, no way to
+        control an individual movement and nothing for the timing of the click,
+        so this is off by default and :class:`Mouse` does the work instead. The
+        two cannot be combined, so turning this on turns that off.
     :param block_images: do not load images at all
     :param block_webrtc: disable WebRTC entirely
     :param enable_cache: keep previously loaded pages and requests around, using more memory
@@ -1710,7 +2129,7 @@ class Browser:
         locale: str | Sequence[str] = '',
         fonts: Sequence[str] | None = None,
         window: tuple[int, int] | None = None,
-        humanize: bool | float = True,
+        humanize: bool | float = False,
         block_images: bool = False,
         block_webrtc: bool = False,
         enable_cache: bool = True,

@@ -84,5 +84,5 @@ class Warmup:
 
 class Browser(CamoufoxBrowser):
     def __init__(self, headless: bool = True, warmup: Warmup | None = None) -> None:
-        super().__init__(headless=headless, humanize=True)
+        super().__init__(headless=headless)
         self.warmup = warmup
