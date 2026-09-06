@@ -852,7 +852,11 @@ if iswindows:  # {{{
     STARTF_USESTDHANDLES = 0x00000100
     CREATE_UNICODE_ENVIRONMENT = 0x00000400
     CREATE_NEW_PROCESS_GROUP = 0x00000200
+    CREATE_SUSPENDED = 0x00000004
     STILL_ACTIVE = 259
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+    JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS = 1
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 
     class STARTUPINFOW(ctypes.Structure):
         _fields_ = [
@@ -884,6 +888,51 @@ if iswindows:  # {{{
             ('dwThreadId', wintypes.DWORD),
         ]
 
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ('ReadOperationCount', ctypes.c_ulonglong),
+            ('WriteOperationCount', ctypes.c_ulonglong),
+            ('OtherOperationCount', ctypes.c_ulonglong),
+            ('ReadTransferCount', ctypes.c_ulonglong),
+            ('WriteTransferCount', ctypes.c_ulonglong),
+            ('OtherTransferCount', ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ('PerProcessUserTimeLimit', ctypes.c_longlong),
+            ('PerJobUserTimeLimit', ctypes.c_longlong),
+            ('LimitFlags', wintypes.DWORD),
+            ('MinimumWorkingSetSize', ctypes.c_size_t),
+            ('MaximumWorkingSetSize', ctypes.c_size_t),
+            ('ActiveProcessLimit', wintypes.DWORD),
+            ('Affinity', ctypes.c_size_t),
+            ('PriorityClass', wintypes.DWORD),
+            ('SchedulingClass', wintypes.DWORD),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ('IoInfo', IO_COUNTERS),
+            ('ProcessMemoryLimit', ctypes.c_size_t),
+            ('JobMemoryLimit', ctypes.c_size_t),
+            ('PeakProcessMemoryUsed', ctypes.c_size_t),
+            ('PeakJobMemoryUsed', ctypes.c_size_t),
+        ]
+
+    class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ('TotalUserTime', ctypes.c_longlong),
+            ('TotalKernelTime', ctypes.c_longlong),
+            ('ThisPeriodTotalUserTime', ctypes.c_longlong),
+            ('ThisPeriodTotalKernelTime', ctypes.c_longlong),
+            ('TotalPageFaultCount', wintypes.DWORD),
+            ('TotalProcesses', wintypes.DWORD),
+            ('ActiveProcesses', wintypes.DWORD),
+            ('TotalTerminatedProcesses', wintypes.DWORD),
+        ]
+
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel32.CreateProcessW.restype = wintypes.BOOL
     kernel32.CreateProcessW.argtypes = [
@@ -906,8 +955,37 @@ if iswindows:  # {{{
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+    def create_job_object() -> int:
+        """Create a job object that kills everything still in it when its last
+        handle is closed, so that no part of the browser can outlive us."""
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return 0
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(wintypes.HANDLE(job), JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS, ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(wintypes.HANDLE(job))
+            return 0
+        return job
 
     class WindowsProcess(Process):
+        def __init__(self, pid_or_handle: int, read_fd: int, write_fd: int, log_path: str, job: int = 0) -> None:
+            super().__init__(pid_or_handle, read_fd, write_fd, log_path)
+            self.job = job
+
         def poll(self) -> int | None:
             if self.returncode is None and self.handle:
                 code = wintypes.DWORD()
@@ -915,21 +993,48 @@ if iswindows:  # {{{
                     self.returncode = code.value
             return self.returncode
 
+        def live_descendants(self) -> int:
+            """The number of processes of the browser that are still running."""
+            if not self.job:
+                return 0
+            info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+            if not kernel32.QueryInformationJobObject(
+                wintypes.HANDLE(self.job), JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION_CLASS, ctypes.byref(info), ctypes.sizeof(info), None
+            ):
+                return 0
+            return info.ActiveProcesses
+
         def wait(self, timeout: float) -> int | None:
+            # The browser is a tree of processes, one for the browser itself and
+            # more for its tabs and its GPU and utility work. They keep files in
+            # the profile directory open, and Windows refuses to delete a file
+            # that is open, so wait for all of them, not just the one we
+            # started, which can even be a launcher process that exits early.
+            deadline = time.monotonic() + timeout
             if self.returncode is None and self.handle:
                 kernel32.WaitForSingleObject(wintypes.HANDLE(self.handle), max(int(timeout * 1000), 0))
-            return self.poll()
+            if self.poll() is None:
+                return None
+            while self.live_descendants() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            return None if self.live_descendants() else self.returncode
 
         def kill(self) -> None:
-            if self.poll() is None and self.handle:
+            if self.job:
+                kernel32.TerminateJobObject(wintypes.HANDLE(self.job), 1)
+            elif self.poll() is None and self.handle:
                 kernel32.TerminateProcess(wintypes.HANDLE(self.handle), 1)
-                self.wait(5)
+            self.wait(5)
 
         def cleanup(self, close_pipes: bool) -> None:
             super().cleanup(close_pipes)
             if self.handle:
                 kernel32.CloseHandle(wintypes.HANDLE(self.handle))
                 self.handle = 0
+            if self.job:
+                # Anything left in the job is killed by this
+                kernel32.CloseHandle(wintypes.HANDLE(self.job))
+                self.job = 0
 
     def spawn_windows(argv: Sequence[str], env: Mapping[str, str], log_path: str) -> WindowsProcess:
         """Start the browser with its command pipe on fd 3 and its response pipe on fd 4."""
@@ -938,6 +1043,7 @@ if iswindows:  # {{{
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         null_fd = os.open(os.devnull, os.O_RDONLY)
         pi = PROCESS_INFORMATION()
+        job = create_job_object()
         try:
             null_handle, log_handle = msvcrt.get_osfhandle(null_fd), msvcrt.get_osfhandle(log_fd)
             child_read, child_write = msvcrt.get_osfhandle(command_read), msvcrt.get_osfhandle(response_write)
@@ -965,15 +1071,31 @@ if iswindows:  # {{{
                 None,
                 None,
                 True,  # the child inherits the handles marked inheritable above
-                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
+                # The process starts suspended so that it is in the job object
+                # before it gets the chance to create any children of its own
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED,
                 ctypes.cast(environment, ctypes.c_void_p),
                 None,
                 ctypes.byref(si),
                 ctypes.byref(pi),
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
-            kernel32.CloseHandle(pi.hThread)
+            try:
+                if job and not kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), pi.hProcess):
+                    debug(f'Failed to put the camoufox browser into a job object: {ctypes.WinError(ctypes.get_last_error())}')
+                    kernel32.CloseHandle(wintypes.HANDLE(job))
+                    job = 0
+                if kernel32.ResumeThread(pi.hThread) == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+            except BaseException:
+                kernel32.TerminateProcess(pi.hProcess, 1)
+                kernel32.CloseHandle(pi.hProcess)
+                raise
+            finally:
+                kernel32.CloseHandle(pi.hThread)
         except BaseException:
+            if job:
+                kernel32.CloseHandle(wintypes.HANDLE(job))
             for fd in (command_write, response_read):
                 close_fd(fd)
             raise
@@ -981,7 +1103,7 @@ if iswindows:  # {{{
             # The child has its own copies of these now
             for fd in (command_read, response_write, log_fd, null_fd):
                 close_fd(fd)
-        return WindowsProcess(pi.hProcess, response_read, command_write, log_path)
+        return WindowsProcess(pi.hProcess, response_read, command_write, log_path, job)
 # }}}
 
 
@@ -2354,9 +2476,27 @@ class Browser:
 
     # }}}
 
+    def reap(self, process: Process, transport: Transport | None) -> None:
+        """Wait for the browser to exit, killing it if it will not, and release
+        the pipes. Every step of this blocks, so it runs in a worker thread."""
+        # Closing the command pipe is what actually makes the browser shut
+        # down cleanly, without it the pipe reader thread inside the browser
+        # hangs and the process dies of a segfault instead
+        self.connection.close()
+        if process.wait(CLOSE_TIMEOUT) is None:
+            debug('The camoufox browser did not exit when asked, killing it')
+            process.kill()
+        if transport is not None:
+            transport.shutdown()
+        process.cleanup(close_pipes=transport is None)
+        if self.keep_log:
+            debug(f'The camoufox browser log is at {process.log_path}')
+
     async def close(self) -> None:
         """Shut the browser down, cleaning up its profile directory."""
-        if self.process is not None:
+        loop = asyncio.get_running_loop()
+        process, self.process = self.process, None
+        if process is not None:
             try:
                 # Ask politely first. The browser never answers this, it just
                 # starts exiting, so do not wait for a reply.
@@ -2364,26 +2504,15 @@ class Browser:
                     self.connection.send_nowait('Browser.close')
             except Error, OSError:
                 pass
-            # Closing the command pipe is what actually makes the browser shut
-            # down cleanly, without it the pipe reader thread inside the browser
-            # hangs and the process dies of a segfault instead
             transport = self.connection.transport
-            self.connection.close()
-            process, self.process = self.process, None
-            exited = await asyncio.get_running_loop().run_in_executor(None, lambda: process.wait(CLOSE_TIMEOUT))
-            if exited is None:
-                debug('The camoufox browser did not exit when asked, killing it')
-                process.kill()
-            if transport is not None:
-                transport.shutdown()
-            process.cleanup(close_pipes=transport is None)
-            if self.keep_log:
-                debug(f'The camoufox browser log is at {process.log_path}')
+            await loop.run_in_executor(None, self.reap, process, transport)
         self.closed = True
         self.pages.clear()
         if self.profile_dir and not self.keep_log:
-            remove_dir(self.profile_dir)
-            self.profile_dir = ''
+            # Deleting the profile retries for a while on Windows, so it must
+            # not run on the event loop either
+            profile_dir, self.profile_dir = self.profile_dir, ''
+            await loop.run_in_executor(None, remove_dir, profile_dir)
 
 
 async def main(args: Sequence[str] = tuple(sys.argv)) -> None:
