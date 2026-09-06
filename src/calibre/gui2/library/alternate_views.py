@@ -1096,6 +1096,7 @@ class GridView(MomentumScrollMixin, QListView):
         pal = self.palette()
         bgcol = QColor(r, g, b)
         pal.setColor(QPalette.ColorRole.Base, bgcol)
+        pal.setColor(QPalette.ColorRole.Window, bgcol)
         pal.setColor(QPalette.ColorRole.WindowText, bgcol)  # frame color
         self._texture_pixmap = None
         if tex:
@@ -1119,6 +1120,7 @@ class GridView(MomentumScrollMixin, QListView):
         # not tiled correctly when the view is scrolled.
         vp = self.viewport()
         assert vp is not None
+        vp.setPalette(pal)
         vp.setAutoFillBackground(self._texture_pixmap is None)
         vp.update()
 
