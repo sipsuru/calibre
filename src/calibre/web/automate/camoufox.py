@@ -1502,13 +1502,30 @@ def quad_contains(corners: Sequence[tuple[float, float]], point: tuple[float, fl
     return True
 
 
+def whole_pixel(value: float) -> float:
+    """The whole pixel nearest to value.
+
+    Halves go up, the way the browser rounds a coordinate, rather than to even,
+    the way :func:`round` does.
+    """
+    return float(math.floor(value + 0.5))
+
+
 def point_to_aim_at(corners: Sequence[tuple[float, float]]) -> tuple[float, float]:
-    """The middle of a convex polygon, preferring a whole pixel because hit
-    testing at fractional coordinates is not reliable."""
+    """A whole pixel in the middle of a convex polygon.
+
+    Mouse events are always dispatched at whole pixels, see
+    :meth:`Mouse.dispatch`, so the middle is snapped onto one. A thin or
+    slanted quad need not contain the pixel nearest its middle, so the
+    neighbouring ones are tried before giving up and using it anyway.
+    """
     x = sum(corner[0] for corner in corners) / len(corners)
     y = sum(corner[1] for corner in corners) / len(corners)
-    rounded = (float(round(x)), float(round(y)))
-    return rounded if quad_contains(corners, rounded) else (x, y)
+    candidates = ((whole_pixel(x), whole_pixel(y)), *((float(px), float(py)) for px in (math.floor(x), math.ceil(x)) for py in (math.floor(y), math.ceil(y))))
+    for candidate in candidates:
+        if quad_contains(corners, candidate):
+            return candidate
+    return candidates[0]
 
 
 def clamp_quad(quad: Mapping[str, Mapping[str, float]], width: float, height: float) -> list[tuple[float, float]]:
@@ -1520,7 +1537,8 @@ class Mouse:
     """Moves the cursor and clicks, the way a hand does.
 
     Available as :attr:`Page.mouse`. Coordinates are in CSS pixels measured
-    from the top left corner of the viewport.
+    from the top left corner of the viewport, and the cursor always comes to
+    rest on a whole one of them, see :meth:`dispatch`.
     """
 
     def __init__(self, page: Page) -> None:
@@ -1535,18 +1553,47 @@ class Mouse:
 
     @property
     def position(self) -> tuple[float, float]:
-        """Where the cursor currently is."""
+        """The whole pixel the cursor is currently on."""
         return self.x, self.y
 
     async def dispatch(self, event_type: str, x: float, y: float, *, button: int = 0, click_count: int = 0, modifiers: int = 0) -> None:
-        """Send a single mouse event to the page."""
+        """Send a single mouse event to the page, at the whole pixel nearest to (x, y).
+
+        The browser does not reply until the event has reached the page, and a
+        fractional coordinate is snapped to a pixel of the browser window,
+        whose grid is not necessarily the one this coordinate is measured on,
+        so sending one risks an event that never arrives anywhere and a command
+        that never completes, see :meth:`move_onto_pixel`.
+        """
         await self.page.send(
             'Page.dispatchMouseEvent',
-            {'type': event_type, 'x': x, 'y': y, 'button': button, 'buttons': self.buttons, 'modifiers': modifiers, 'clickCount': click_count},
+            {
+                'type': event_type,
+                'x': whole_pixel(x),
+                'y': whole_pixel(y),
+                'button': button,
+                'buttons': self.buttons,
+                'modifiers': modifiers,
+                'clickCount': click_count,
+            },
         )
 
+    async def move_onto_pixel(self, x: float, y: float, modifiers: int = 0) -> None:
+        """Move the cursor onto the whole pixel nearest to (x, y).
+
+        Nothing is sent if the cursor is already on that pixel. A movement that
+        does not take the cursor to a new pixel never reaches the page, and the
+        browser acknowledges a mouse event only once the page has seen it, so
+        such a movement is never answered at all and would instead be waited on
+        until the command times out.
+        """
+        px, py = whole_pixel(x), whole_pixel(y)
+        if (px, py) != (self.x, self.y):
+            await self.dispatch('mousemove', px, py, modifiers=modifiers)
+            self.x, self.y = px, py
+
     async def move(self, x: float, y: float, *, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()) -> None:
-        """Move the cursor to (x, y).
+        """Move the cursor onto the whole pixel nearest to (x, y).
 
         :param human: follow a human like path instead of jumping straight
             there. The default, None, means do so unless the browser has been
@@ -1563,14 +1610,10 @@ class Mouse:
             for px, py, at in human_trajectory((self.x, self.y), (x, y), max_time=max_time):
                 if (delay := started + at - time.monotonic()) > 0:
                     await asyncio.sleep(delay)
-                # The browser discards a movement onto the pixel the cursor is
-                # already on, so there is no point paying for one
-                if round(px) != round(self.x) or round(py) != round(self.y):
-                    await self.dispatch('mousemove', px, py, modifiers=mask)
-                    self.x, self.y = px, py
-        elif round(x) != round(self.x) or round(y) != round(self.y):
-            await self.dispatch('mousemove', x, y, modifiers=mask)
-        self.x, self.y = x, y
+                await self.move_onto_pixel(px, py, mask)
+        # The steps of a path that land on the pixel the cursor is already on
+        # are skipped, including the last one, so the journey is finished here
+        await self.move_onto_pixel(x, y, mask)
 
     async def down(self, button: str = 'left', *, click_count: int = 1, modifiers: Sequence[str] = ()) -> None:
         """Press a mouse button where the cursor currently is."""
