@@ -30,6 +30,12 @@ jobs:
               run:
                   python setup/unix-ci.py bootstrap
 
+            # Downloads the Camoufox browser, without which the browser
+            # automation tests skip themselves
+            - name: Download browser automation dependencies
+              run:
+                  python setup/unix-ci.py browser-deps
+
             - name: Test calibre
               env:
                 PYTHONWARNINGS: error

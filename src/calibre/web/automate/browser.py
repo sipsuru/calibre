@@ -48,7 +48,7 @@ fox_news_topics = (
 
 
 class Warmup:
-    def __init__(self, *forced_urls: str, min_num: int = 2, max_num: int = 3, excluded_domains: Iterable[str] = ()):
+    def __init__(self, *forced_urls: str, min_num: int = 2, max_num: int = 3, excluded_domains: Iterable[str] = ()) -> None:
         foxes = tuple(f'https://www.foxnews.com/{x}' for x in random.choices(fox_news_topics, k=2))
         bbc = tuple(f'https://www.bbc.com/{x}' for x in random.choices(bbc_topics, k=2))
         wiki = tuple(f'https://en.wikipedia.org/wiki/{x}' for x in random.choices(wikipedia_topics, k=2))
@@ -83,6 +83,6 @@ class Warmup:
 
 
 class Browser(CamoufoxBrowser):
-    def __init__(self, headless: bool = True, warmup: Warmup | None = None):
+    def __init__(self, headless: bool = True, warmup: Warmup | None = None) -> None:
         super().__init__(headless=headless, humanize=True)
         self.warmup = warmup

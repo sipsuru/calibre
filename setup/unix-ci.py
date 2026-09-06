@@ -140,12 +140,25 @@ def install_qt_source_code():
     os.environ['QT_SRC'] = qdir
 
 
-def run_python(*args):
+def run_python(*args, timeout=1200, print_crash_reports: bool = True):
     python = os.path.expandvars('$SW/bin/python')
     if len(args) == 1:
         args = shlex.split(args[0])
     args = [python] + list(args)
-    run(*args, print_crash_reports=True)
+    run(*args, timeout=timeout, print_crash_reports=print_crash_reports)
+
+
+def runtime_env():
+    """The environment needed to run calibre code, as opposed to merely build it."""
+    os.environ['CI'] = 'true'
+    os.environ['OPENSSL_MODULES'] = os.path.join(SW, 'lib', 'ossl-modules')
+    os.environ['PIPER_TTS_DIR'] = os.path.join(SW, 'piper')
+    if ismacos:
+        os.environ['SSL_CERT_DIR'] = os.path.abspath('resources/mozilla-ca-certs')
+        # needed to ensure correct libxml2 is loaded
+        os.environ['DYLD_INSERT_LIBRARIES'] = ':'.join(os.path.join(SW, 'lib', x) for x in 'libxml2.dylib libxslt.dylib libexslt.dylib'.split())
+        os.environ['OPENSSL_ENGINES'] = os.path.join(SW, 'lib', 'engines-3')
+    install_env()
 
 
 def install_linux_deps():
@@ -165,6 +178,9 @@ def install_linux_deps():
         'libasound2t64',
         'libflite1',
         'libspeechd2',
+        # needed by the Camoufox browser, which is a fork of Firefox
+        'libdbus-glib-1-2',
+        'libgtk-3-0t64',
     )
 
 
@@ -320,17 +336,13 @@ username = api
         get_tx()
         os.environ['TX'] = os.path.abspath('tx')
         run(sys.executable, 'setup.py', 'pot', timeout=30 * 60)
-    elif action == 'test':
-        os.environ['CI'] = 'true'
-        os.environ['OPENSSL_MODULES'] = os.path.join(SW, 'lib', 'ossl-modules')
-        os.environ['PIPER_TTS_DIR'] = os.path.join(SW, 'piper')
-        if ismacos:
-            os.environ['SSL_CERT_DIR'] = os.path.abspath('resources/mozilla-ca-certs')
-            # needed to ensure correct libxml2 is loaded
-            os.environ['DYLD_INSERT_LIBRARIES'] = ':'.join(os.path.join(SW, 'lib', x) for x in 'libxml2.dylib libxslt.dylib libexslt.dylib'.split())
-            os.environ['OPENSSL_ENGINES'] = os.path.join(SW, 'lib', 'engines-3')
+    elif action == 'browser-deps':
+        runtime_env()
+        # Hundreds of megabytes of browser, so allow plenty of time for it
+        run_python('setup.py browser_deps', timeout=1800, print_crash_reports=False)
 
-        install_env()
+    elif action == 'test':
+        runtime_env()
         run_python('setup.py test')
         if not ismacos:  # webengine is flaky on macOS
             run_python('setup.py test_rs')

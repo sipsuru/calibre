@@ -28,7 +28,7 @@ class FakeInstaller(dd.Installer):
         self.num_of_installs = 0
         self.fail_downloads_of: set[str] = set()
 
-    def latest_release(self, **kw: Any) -> dd.Release:
+    def latest_release(self, **kw: Any) -> dd.Release:  # noqa: ANN401
         self.num_of_release_queries += 1
         return self.available
 
@@ -325,7 +325,7 @@ class TestDownloadDeps(unittest.TestCase):
                 f.write(name)
 
         class FakeBayesianNetwork:
-            def __init__(self, path: Any) -> None:
+            def __init__(self, path: str | dd.Path) -> None:
                 self.path = str(path)
 
         datapoints = types.ModuleType(dd.BROWSERFORGE_DATA_PACKAGE)
@@ -372,5 +372,5 @@ class TestDownloadDeps(unittest.TestCase):
                     sys.modules[name] = mod
 
 
-def find_tests():
+def find_tests() -> unittest.TestSuite:
     return unittest.defaultTestLoader.loadTestsFromTestCase(TestDownloadDeps)

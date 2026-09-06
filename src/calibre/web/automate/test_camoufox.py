@@ -11,6 +11,7 @@ import struct
 import tempfile
 import threading
 import unittest
+from collections.abc import Awaitable, Callable
 
 from calibre.constants import iswindows
 from calibre.web.automate import camoufox
@@ -363,7 +364,7 @@ class TestCamoufoxBrowser(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.server.close()
 
-    def run_browser(self, coro, **kw: object) -> object:
+    def run_browser(self, coro: Callable[[camoufox.Browser], Awaitable[object]], **kw: object) -> object:
         async def main() -> object:
             async with camoufox.Browser(headless=True, **kw) as browser:  # type: ignore[arg-type]
                 self.profile_dir = browser.profile_dir

@@ -70,7 +70,7 @@ class Error(Exception):
 class ProtocolError(Error):
     """The browser reported an error in response to a command."""
 
-    def __init__(self, method: str, message: str, data: str = ''):
+    def __init__(self, method: str, message: str, data: str = '') -> None:
         super().__init__(f'{method} failed: {message}')
         self.method, self.message, self.data = method, message, data
 
@@ -492,7 +492,7 @@ def config_property_types(resource_dir: str) -> dict[str, str]:
         return {entry['property']: entry['type'] for entry in json.loads(f.read())}
 
 
-def value_has_type(value: Any, expected: str) -> bool:
+def value_has_type(value: Any, expected: str) -> bool:  # noqa: ANN401
     match expected:
         case 'str':
             return isinstance(value, str)
@@ -630,7 +630,7 @@ class Transport:
     threads that hand messages to and from the event loop.
     """
 
-    def __init__(self, read_fd: int, write_fd: int, loop: asyncio.AbstractEventLoop, on_message: Callable[[bytes], None], on_close: Callable[[], None]):
+    def __init__(self, read_fd: int, write_fd: int, loop: asyncio.AbstractEventLoop, on_message: Callable[[bytes], None], on_close: Callable[[], None]) -> None:
         self.read_fd, self.write_fd = read_fd, write_fd
         self.loop, self.on_message, self.on_close = loop, on_message, on_close
         self.write_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
@@ -640,7 +640,7 @@ class Transport:
         self.reader.start()
         self.writer.start()
 
-    def call_in_loop(self, func: Callable[..., Any], *args: Any) -> None:
+    def call_in_loop(self, func: Callable[..., Any], *args: Any) -> None:  # noqa: ANN401
         try:
             self.loop.call_soon_threadsafe(func, *args)
         except RuntimeError:
@@ -697,7 +697,7 @@ class Transport:
 class Process:
     """The running browser process, and the pipes used to talk to it."""
 
-    def __init__(self, pid_or_handle: int, read_fd: int, write_fd: int, log_path: str):
+    def __init__(self, pid_or_handle: int, read_fd: int, write_fd: int, log_path: str) -> None:
         self.read_fd, self.write_fd, self.log_path = read_fd, write_fd, log_path
         self.returncode: int | None = None
         if iswindows:
@@ -1102,7 +1102,7 @@ class EventWaiter:
         self.waiters.clear()
 
 
-async def wait_for(future: asyncio.Future[Any], timeout: float, what: str) -> Any:
+async def wait_for(future: asyncio.Future[Any], timeout: float, what: str) -> Any:  # noqa: ANN401
     try:
         async with asyncio.timeout(timeout):
             return await future
@@ -1214,14 +1214,14 @@ class Resource(NamedTuple):
 class Element:
     """A handle to a DOM node in a page."""
 
-    def __init__(self, page: Page, object_id: str):
+    def __init__(self, page: Page, object_id: str) -> None:
         self.page, self.object_id = page, object_id
         self.disposed = False
 
     def __repr__(self) -> str:
         return f'<Element {self.object_id}{" (disposed)" if self.disposed else ""}>'
 
-    async def call(self, function_declaration: str, *args: Any, by_value: bool = True) -> Any:
+    async def call(self, function_declaration: str, *args: Any, by_value: bool = True) -> Any:  # noqa: ANN401
         """Call a JavaScript function with this element as its first argument."""
         if self.disposed:
             raise Error('This element handle has been disposed')
@@ -1290,7 +1290,7 @@ class Element:
 class Page:
     """A single tab in the browser."""
 
-    def __init__(self, browser: Browser, session_id: str, target_id: str, opener_id: str = ''):
+    def __init__(self, browser: Browser, session_id: str, target_id: str, opener_id: str = '') -> None:
         self.browser, self.session_id, self.target_id, self.opener_id = browser, session_id, target_id, opener_id
         self.connection = browser.connection
         self.main_frame = ''
@@ -1408,7 +1408,7 @@ class Page:
         await wait_for(self.events.expect(is_our_context), timeout, 'a JavaScript execution context')
         return self.execution_context
 
-    def unwrap(self, result: Mapping[str, Any], by_value: bool) -> Any:
+    def unwrap(self, result: Mapping[str, Any], by_value: bool) -> Any:  # noqa: ANN401
         if (details := result.get('exceptionDetails')) is not None:
             raise JavaScriptError(details.get('text') or details.get('stack') or repr(details.get('value')))
         obj = result.get('result') or {}
@@ -1420,7 +1420,7 @@ class Page:
             return {'Infinity': float('inf'), '-Infinity': float('-inf'), '-0': -0.0, 'NaN': float('nan')}[unserializable]
         return obj.get('value')
 
-    async def evaluate(self, expression: str, *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    async def evaluate(self, expression: str, *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:  # noqa: ANN401
         """Evaluate a JavaScript expression in the page and return its value.
 
         Pass by_value=False to get an :class:`Element` handle back for
@@ -1437,7 +1437,7 @@ class Page:
         result = await self.send('Runtime.evaluate', {'executionContextId': context, 'expression': expression, 'returnByValue': by_value}, timeout)
         return self.unwrap(result, by_value)
 
-    async def call(self, function_declaration: str, *args: Any, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:
+    async def call(self, function_declaration: str, *args: Any, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:  # noqa: ANN401
         """Call a JavaScript function in the page, passing args to it.
 
         See :meth:`evaluate` for the caveat about functions that return a
@@ -1447,7 +1447,7 @@ class Page:
 
     async def call_with_handles(
         self, function_declaration: str, args: Sequence[Mapping[str, Any]], *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT
-    ) -> Any:
+    ) -> Any:  # noqa: ANN401
         context = await self.wait_for_execution_context(timeout)
         result = await self.send(
             'Runtime.callFunction',
@@ -1720,7 +1720,7 @@ class Browser:
         allow_prerelease: bool = False,
         launch_timeout: float = LAUNCH_TIMEOUT,
         keep_log: bool = False,
-    ):
+    ) -> None:
         self.headless, self.target_os = headless, check_valid_os(target_os or current_os())
         self.locale, self.fonts, self.window, self.humanize = locale, fonts, window, humanize
         self.block_images, self.block_webrtc, self.enable_cache = block_images, block_webrtc, enable_cache
@@ -1745,7 +1745,7 @@ class Browser:
         await self.launch()
         return self
 
-    async def __aexit__(self, *args: Any) -> None:
+    async def __aexit__(self, *args: Any) -> None:  # noqa: ANN401
         await self.close()
 
     # Launching {{{

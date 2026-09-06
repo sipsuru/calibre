@@ -59,7 +59,7 @@ BROWSERFORGE_DATA_FILES = {
 }
 
 
-def debug(*a: Any) -> None:
+def debug(*a: object) -> None:
     print(*a, file=sys.stderr, flush=True)
 
 
@@ -77,7 +77,7 @@ def download_data(url: str, headers: dict[str, str] | None = None) -> bytes:
         return response.read()
 
 
-def download_json(url: str, headers: dict[str, str] | None = None) -> Any:
+def download_json(url: str, headers: dict[str, str] | None = None) -> Any:  # noqa: ANN401
     return json.loads(download_data(url, headers))
 
 
@@ -207,7 +207,7 @@ class Installer:
     access from multiple processes.
     """
 
-    def __init__(self, name: str):
+    def __init__(self, name: str) -> None:
         self.name = name
         # Serializes calls in this process, cross process serialization is done
         # via a lock on the metadata file
@@ -217,7 +217,7 @@ class Installer:
 
     # Implemented by subclasses {{{
 
-    def latest_release(self, **kw: Any) -> Release:
+    def latest_release(self, **kw: Any) -> Release:  # noqa: ANN401
         raise NotImplementedError('Must be implemented by subclass')
 
     def unpack(self, downloaded_file: str, dest: str) -> None:
@@ -325,7 +325,7 @@ class Installer:
             return None
         return update
 
-    def __call__(self, **kw: Any) -> Install:
+    def __call__(self, **kw: Any) -> Install:  # noqa: ANN401
         """Return the installed dependency, installing or updating it as needed."""
         needs_update_check = False
         with self.thread_lock, ExclusiveFile(self.metadata_path, timeout=INSTALL_LOCK_TIMEOUT) as f:
@@ -429,7 +429,7 @@ class Camoufox(Installer):
     def __init__(self) -> None:
         super().__init__('camoufox')
 
-    def latest_release(self, allow_prerelease: bool = False, **kw: Any) -> Release:
+    def latest_release(self, allow_prerelease: bool = False, **kw: Any) -> Release:  # noqa: ANN401
         pat = camoufox_asset_pattern()
         releases = download_json(f'https://api.github.com/repos/{CAMOUFOX_REPO}/releases?per_page=50', GITHUB_HEADERS)
         ans: Release | None = None
@@ -505,7 +505,7 @@ class BrowserforgeData(Installer):
     def __init__(self) -> None:
         super().__init__('browserforge')
 
-    def latest_release(self, **kw: Any) -> Release:
+    def latest_release(self, **kw: Any) -> Release:  # noqa: ANN401
         # The data files are distributed as the apify_fingerprint_datapoints package
         name = BROWSERFORGE_DATA_PACKAGE.replace('_', '-')
         data = download_json(f'https://pypi.org/pypi/{name}/json')
@@ -563,12 +563,21 @@ def constant_path(path: Path) -> Callable[[], Path]:
 
 def patch_browserforge_data_files(data_dir: str) -> None:
     """Make browserforge use the data files in data_dir instead of the ones from
-    the apify_fingerprint_datapoints package."""
-    global _patched_data_dir
-    import apify_fingerprint_datapoints
+    the apify_fingerprint_datapoints package.
 
+    Does nothing if that package is not installed, since then there is nothing
+    to patch.
+    """
+    global _patched_data_dir
     with _patch_lock:
         if _patched_data_dir == data_dir:
+            return
+        try:
+            import apify_fingerprint_datapoints
+        except ImportError:
+            debug(f'Not patching the browserforge data files as the {BROWSERFORGE_DATA_PACKAGE} package is not installed')
+            # Nothing more can be done for this data_dir, so dont warn about it again
+            _patched_data_dir = data_dir
             return
         paths = {getter: Path(os.path.join(data_dir, name)) for getter, name in BROWSERFORGE_DATA_FILES.items()}
         for getter, path in paths.items():
@@ -613,7 +622,13 @@ def browserforge_data(patch_browserforge: bool = True) -> str:
         traceback.print_exc()
         return packaged_browserforge_data_dir()
     if patch_browserforge and is_newer(install.version, packaged_browserforge_data_version()):
-        patch_browserforge_data_files(install.path)
+        try:
+            patch_browserforge_data_files(install.path)
+        except Exception:
+            # Patching is best effort, the downloaded data files are returned
+            # to the caller regardless
+            debug('Failed to make browserforge use the downloaded data files with error:')
+            traceback.print_exc()
     return install.path
 
 
