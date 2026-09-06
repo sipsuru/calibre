@@ -5,9 +5,7 @@ import random
 from collections.abc import Iterable
 from urllib.parse import urlparse
 
-from camoufox.async_api import AsyncCamoufox  # type: ignore
-
-from calibre.constants import ismacos, iswindows
+from calibre.web.automate.camoufox import Browser as CamoufoxBrowser
 
 wikipedia_topics = (
     'Lists_of_deaths_by_year',
@@ -84,7 +82,7 @@ class Warmup:
         pass
 
 
-class Browser(AsyncCamoufox):
+class Browser(CamoufoxBrowser):
     def __init__(self, headless: bool = True, warmup: Warmup | None = None):
-        os = 'windows' if iswindows else ('macos' if ismacos else 'linux')
-        super().__init__(headless=headless, os=os, humanize=True)
+        super().__init__(headless=headless, humanize=True)
+        self.warmup = warmup

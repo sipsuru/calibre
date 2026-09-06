@@ -1,0 +1,1992 @@
+#!/usr/bin/env python
+# License: GPLv3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
+
+"""
+An asyncio based API for driving the Camoufox browser.
+
+Camoufox is a fork of Firefox that hides the fact that it is being automated and
+allows the fingerprint it presents to web pages (the values reported by
+``navigator``, ``screen``, the list of installed fonts, WebGL, etc.) to be
+spoofed. The browser binary is downloaded on demand by
+:mod:`calibre.web.automate.download_deps`.
+
+The browser is driven using the Juggler protocol, which is the protocol
+Playwright uses to drive Firefox. Messages are NUL delimited JSON objects
+exchanged over a pair of pipes connected to file descriptors 3 and 4 of the
+browser process. Implementing the protocol directly means the only dependency
+outside the standard library is browserforge, which is used solely to generate
+fingerprints.
+
+Typical usage::
+
+    async with Browser() as browser:
+        page = browser.page
+        await page.open('https://example.com')
+        await page.remove('script, style')
+        html = await page.html()
+        img = await page.get_resource('https://example.com/logo.png')
+"""
+
+import asyncio
+import base64
+import json
+import os
+import queue
+import random
+import re
+import struct
+import sys
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from functools import lru_cache
+from typing import Any, NamedTuple
+
+from calibre.constants import cache_dir, ismacos, iswindows
+from calibre.utils.safe_atexit import remove_dir
+from calibre.web.automate.download_deps import browserforge_data, camoufox_installer, camoufox_resource_dir, debug
+
+DEFAULT_TIMEOUT = 60.0  # seconds, for individual protocol commands
+LAUNCH_TIMEOUT = 180.0  # seconds, the first launch has to create a fresh profile
+CLOSE_TIMEOUT = 20.0  # seconds to wait for the browser to exit before killing it
+MAX_TRACKED_REQUESTS = 2048  # per page, bounds the memory used to map URLs to network requests
+
+# The OS names used by camoufox in its config, its bundled data directories and
+# its user agent strings, respectively
+OS_NAMES = ('windows', 'macos', 'linux')
+OS_DIRS = {'windows': 'windows', 'macos': 'macos', 'linux': 'linux'}
+OS_ABBREV = {'windows': 'win', 'macos': 'mac', 'linux': 'lin'}
+
+
+def current_os() -> str:
+    return 'windows' if iswindows else ('macos' if ismacos else 'linux')
+
+
+class Error(Exception):
+    """Base class for all errors raised by this module."""
+
+
+class ProtocolError(Error):
+    """The browser reported an error in response to a command."""
+
+    def __init__(self, method: str, message: str, data: str = ''):
+        super().__init__(f'{method} failed: {message}')
+        self.method, self.message, self.data = method, message, data
+
+
+class BrowserClosedError(Error):
+    """The browser process exited or the connection to it was lost."""
+
+
+class JavaScriptError(Error):
+    """Evaluating JavaScript in the page raised an exception."""
+
+
+class TimeoutExceeded(Error):
+    """An operation did not complete within its allotted time."""
+
+
+# Fingerprint generation {{{
+
+# Maps the fields of a browserforge fingerprint onto camoufox config properties.
+# This is a transcription of browserforge.yml from the camoufox package. Fields
+# that are absent are deliberately not spoofed, see that file for the reasoning,
+# in particular note that videoCard is omitted because browserforge generates
+# Chrome flavored values such as 'ANGLE (AMD, ... Direct3D11 ...)' which would
+# be a glaring inconsistency in a Firefox based browser.
+BROWSERFORGE_MAP: dict[str, Any] = {
+    'navigator': {
+        'userAgent': 'navigator.userAgent',
+        'doNotTrack': 'navigator.doNotTrack',
+        'appCodeName': 'navigator.appCodeName',
+        'appName': 'navigator.appName',
+        'appVersion': 'navigator.appVersion',
+        'oscpu': 'navigator.oscpu',
+        'platform': 'navigator.platform',
+        'hardwareConcurrency': 'navigator.hardwareConcurrency',
+        'product': 'navigator.product',
+        'maxTouchPoints': 'navigator.maxTouchPoints',
+        'extraProperties': {
+            'globalPrivacyControl': 'navigator.globalPrivacyControl',
+        },
+    },
+    'screen': {
+        'availLeft': 'screen.availLeft',
+        'availTop': 'screen.availTop',
+        'availWidth': 'screen.availWidth',
+        'availHeight': 'screen.availHeight',
+        'height': 'screen.height',
+        'width': 'screen.width',
+        'colorDepth': 'screen.colorDepth',
+        'pixelDepth': 'screen.pixelDepth',
+        'pageXOffset': 'screen.pageXOffset',
+        'pageYOffset': 'screen.pageYOffset',
+        'outerHeight': 'window.outerHeight',
+        'outerWidth': 'window.outerWidth',
+        'innerHeight': 'window.innerHeight',
+        'innerWidth': 'window.innerWidth',
+        'screenX': 'window.screenX',
+        'screenY': 'window.screenY',
+    },
+    'headers': {
+        'Accept-Encoding': 'headers.Accept-Encoding',
+    },
+    'battery': {
+        'charging': 'battery:charging',
+        'chargingTime': 'battery:chargingTime',
+        'dischargingTime': 'battery:dischargingTime',
+    },
+}
+
+# Fonts that must always be present in the generated font subset, because a real
+# installation of the OS in question always has them
+ESSENTIAL_FONTS = {
+    'macos': (
+        'Arial',
+        'Helvetica',
+        'Times New Roman',
+        'Courier New',
+        'Verdana',
+        'Georgia',
+        'Trebuchet MS',
+        'Tahoma',
+        'Helvetica Neue',
+        'Lucida Grande',
+        'Menlo',
+        'Monaco',
+        'Geneva',
+        'PingFang HK',
+        'PingFang SC',
+        'PingFang TC',
+    ),
+    'windows': (
+        'Arial',
+        'Times New Roman',
+        'Courier New',
+        'Verdana',
+        'Georgia',
+        'Trebuchet MS',
+        'Tahoma',
+        'Segoe UI',
+        'Calibri',
+        'Cambria Math',
+        'Nirmala UI',
+        'Consolas',
+    ),
+    'linux': (
+        'Arimo',
+        'Cousine',
+        'Tinos',
+        'Twemoji Mozilla',
+        'Noto Sans Devanagari',
+        'Noto Sans JP',
+        'Noto Sans KR',
+        'Noto Sans SC',
+        'Noto Sans TC',
+    ),
+}
+
+# Fonts used by fingerprinting scripts to detect the OS. They must be present or
+# the reported OS will not match the rest of the fingerprint.
+MARKER_FONTS = {
+    'macos': ('Helvetica Neue', 'PingFang HK', 'PingFang SC', 'PingFang TC'),
+    'windows': ('Segoe UI', 'Tahoma', 'Cambria Math', 'Nirmala UI'),
+    'linux': ('Arimo', 'Cousine', 'Tinos', 'Twemoji Mozilla'),
+}
+
+# Firefox preferences needed to make WebGL work in headless mode. Without them
+# there is no WebGL context at all, which is a strong signal that the browser is
+# not a normal desktop browser.
+BASE_USER_PREFS: dict[str, Any] = {
+    'webgl.force-enabled': True,
+    'webgl.enable-webgl2': True,
+    # Camoufox cannot open new windows, so make sure nothing tries to
+    'browser.link.open_newwindow': 3,
+    'browser.link.open_newwindow.restriction': 0,
+    # Avoid pointless network traffic and startup work
+    'browser.shell.checkDefaultBrowser': False,
+    'browser.startup.homepage_override.mstone': 'ignore',
+    'datareporting.policy.dataSubmissionEnabled': False,
+    'datareporting.healthreport.uploadEnabled': False,
+    'toolkit.telemetry.enabled': False,
+    'app.update.auto': False,
+    'extensions.update.enabled': False,
+}
+
+# Preferences that make the browser keep previously loaded pages and requests
+# around, at the cost of using more memory
+CACHE_USER_PREFS: dict[str, Any] = {
+    'browser.sessionhistory.max_entries': 10,
+    'browser.sessionhistory.max_total_viewers': -1,
+    'browser.cache.memory.enable': True,
+    'browser.cache.disk_cache_ssl': True,
+    'browser.cache.disk.smart_size.enabled': True,
+}
+
+
+def check_valid_os(target_os: str) -> str:
+    if target_os not in OS_NAMES:
+        raise ValueError(f'{target_os} is not a valid operating system, must be one of: {", ".join(OS_NAMES)}')
+    return target_os
+
+
+def cast_to_properties(dest: dict[str, Any], mapping: Mapping[str, Any], src: Mapping[str, Any], ff_version: str) -> None:
+    """Copy the values in src into dest, renaming them as specified by mapping."""
+    for key, value in src.items():
+        if not value:  # browserforge uses falsey values to mean "not set"
+            continue
+        target = mapping.get(key)
+        if not target:
+            continue
+        if isinstance(target, dict):
+            if isinstance(value, dict):
+                cast_to_properties(dest, target, value, ff_version)
+            continue
+        if isinstance(value, int) and not isinstance(value, bool) and target.startswith('screen.') and value < 0:
+            value = 0
+        if isinstance(value, str):
+            # browserforge fingerprints tend to name an older Firefox than the
+            # one we are actually running, replace the major version
+            value = re.sub(r'(?<!\d)(1[0-9]{2})(\.0)(?!\d)', rf'{ff_version}\2', value)
+        dest[target] = value
+
+
+def set_screen_y(config: dict[str, Any], screen: Mapping[str, Any]) -> None:
+    """Derive window.screenY, which browserforge does not generate, from screenX."""
+    if 'window.screenY' in config:
+        return
+    screen_x = screen.get('screenX') or 0
+    if not screen_x:
+        config['window.screenX'] = config['window.screenY'] = 0
+        return
+    if -50 <= screen_x <= 50:  # the window is maximized, y matches x
+        config['window.screenY'] = screen_x
+        return
+    span = (screen.get('availHeight') or 0) - (screen.get('outerHeight') or 0)
+    if span == 0:
+        config['window.screenY'] = 0
+    elif span > 0:
+        config['window.screenY'] = random.randrange(0, span)
+    else:
+        config['window.screenY'] = random.randrange(span, 0)
+
+
+def clamp_window_dimensions(config: dict[str, Any]) -> None:
+    """Ensure the spoofed window is not larger than the spoofed screen."""
+    for window_key, screen_key in (('window.outerWidth', 'screen.availWidth'), ('window.outerHeight', 'screen.availHeight')):
+        window, screen = config.get(window_key), config.get(screen_key)
+        if isinstance(window, int) and isinstance(screen, int) and screen and window > screen:
+            config[window_key] = screen
+    for inner_key, outer_key in (('window.innerWidth', 'window.outerWidth'), ('window.innerHeight', 'window.outerHeight')):
+        inner, outer = config.get(inner_key), config.get(outer_key)
+        if isinstance(inner, int) and isinstance(outer, int) and inner > outer:
+            config[inner_key] = outer
+
+
+def fix_navigator_arch(config: dict[str, Any], target_os: str) -> None:
+    """Make navigator.platform and navigator.oscpu consistent with the target OS."""
+    ua = config.get('navigator.userAgent') or ''
+    if target_os == 'windows':
+        platform, oscpu = 'Win32', 'Windows NT 10.0; Win64; x64'
+    elif target_os == 'macos':
+        platform, oscpu = 'MacIntel', 'Intel Mac OS X 10.15'
+    else:
+        platform = 'Linux x86_64'
+        oscpu = 'Linux aarch64' if 'aarch64' in ua else 'Linux x86_64'
+    config.setdefault('navigator.platform', platform)
+    config.setdefault('navigator.oscpu', oscpu)
+
+
+def set_media_devices_defaults(config: dict[str, Any]) -> None:
+    """A machine with no microphone and no camera at all is an unusual, and so
+    identifying, thing to be. Report one of each."""
+    config.setdefault('mediaDevices:enabled', True)
+    config.setdefault('mediaDevices:micros', 1)
+    config.setdefault('mediaDevices:webcams', 1)
+    config.setdefault('mediaDevices:speakers', 0)
+
+
+# Fonts {{{
+
+
+def sfnt_name_table(raw: bytes, offset: int = 0) -> bytes | None:
+    """Return the raw 'name' table of the SFNT font whose table directory starts at offset."""
+    if len(raw) < offset + 12:
+        return None
+    num_tables = struct.unpack_from(b'>H', raw, offset + 4)[0]
+    for i in range(num_tables):
+        pos = offset + 12 + 16 * i
+        if len(raw) < pos + 16:
+            break
+        tag, _, table_offset, table_size = struct.unpack_from(b'>4sLLL', raw, pos)
+        if tag == b'name':
+            return raw[table_offset : table_offset + table_size]
+    return None
+
+
+def font_families_in(path: str) -> set[str]:
+    """The font families defined by the font file at path, which can be a
+    TrueType/OpenType font or a TrueType collection."""
+    from calibre.utils.fonts.utils import get_font_names
+
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if raw[:4] == b'ttcf':  # a collection, with one table directory per font
+        num_fonts = struct.unpack_from(b'>L', raw, 8)[0]
+        offsets: Sequence[int] = struct.unpack_from(f'>{num_fonts}L'.encode(), raw, 12)
+    else:
+        offsets = (0,)
+    ans = set()
+    for offset in offsets:
+        table = sfnt_name_table(raw, offset)
+        if table is None:
+            continue
+        try:
+            family = get_font_names(table, raw_is_table=True)[0]
+        except Exception:
+            continue
+        if family:
+            ans.add(family)
+    return ans
+
+
+def read_font_families(resource_dir: str, target_os: str) -> tuple[str, ...]:
+    """The font families camoufox bundles for target_os.
+
+    The list is read from the font files themselves rather than from a hard
+    coded table so that it stays in sync with whatever version of the browser
+    happens to be installed, and so that we never claim to have a font the
+    browser cannot actually render.
+    """
+    ans: set[str] = set()
+    base = os.path.join(resource_dir, 'fonts')
+    # Fonts directly in the fonts dir, such as Twemoji, are shared by every OS
+    for d in (base, os.path.join(base, OS_DIRS[target_os])):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                ans |= font_families_in(path)
+            except Exception:
+                continue  # not a font file we can read, ignore it
+    return tuple(sorted(ans))
+
+
+@lru_cache(maxsize=4)
+def font_families(resource_dir: str, version: str, target_os: str) -> tuple[str, ...]:
+    """Like read_font_families() but cached on disk, since parsing a few hundred
+    font files takes a noticeable fraction of a second."""
+    cache_path = os.path.join(cache_dir(), f'camoufox-fonts-{version}.json')
+    try:
+        with open(cache_path, 'rb') as f:
+            cached = json.loads(f.read())
+        if isinstance(cached, dict) and isinstance(cached.get(target_os), list):
+            return tuple(cached[target_os])
+    except Exception:
+        cached = {}
+    if not isinstance(cached, dict):
+        cached = {}
+    ans = read_font_families(resource_dir, target_os)
+    cached[target_os] = list(ans)
+    try:
+        with open(cache_path, 'wb') as f:
+            f.write(json.dumps(cached).encode('utf-8'))
+    except OSError:
+        pass  # an unwritable cache dir is not fatal, we just pay to parse again
+    return ans
+
+
+def random_font_subset(families: Sequence[str], target_os: str) -> list[str]:
+    """A random subset of families, the way camoufox generates one.
+
+    A real machine has a more or less arbitrary set of fonts installed, so
+    reporting the same list every time would itself be identifying. The fonts
+    that every installation of the OS has, and the fonts used to detect the OS,
+    are always included.
+    """
+    essential = frozenset(ESSENTIAL_FONTS[target_os])
+    always = [f for f in families if f in essential]
+    optional = [f for f in families if f not in essential]
+    count = round(random.uniform(0.30, 0.78) * len(optional))
+    ans = always + random.sample(optional, min(count, len(optional)))
+    present = set(ans)
+    available = frozenset(families)
+    for marker in MARKER_FONTS[target_os]:
+        # Only claim a marker font if the browser can really render it
+        if marker not in present and marker in available:
+            ans.append(marker)
+    return sorted(ans)
+
+
+def fontconfig_path(resource_dir: str, version: str, target_os: str) -> str:
+    """Generate the fontconfig file that limits the fonts visible to the browser
+    to the ones camoufox bundles for target_os, and return its path.
+
+    The bundled fonts.conf refers to the font directory relative to the current
+    working directory, which is of no use to us, so it is rewritten to use an
+    absolute path. Only needed on Linux, elsewhere camoufox restricts the fonts
+    itself.
+    """
+    for name in ('fontconfig', 'fontconfigs'):  # renamed in camoufox v150
+        src = os.path.join(resource_dir, name, OS_DIRS[target_os], 'fonts.conf')
+        if os.path.exists(src):
+            break
+    else:
+        raise Error(f'The camoufox install in {resource_dir} has no fonts.conf for {target_os}')
+    with open(src) as f:
+        conf = f.read()
+    fonts_dir = os.path.join(resource_dir, 'fonts')
+    conf = conf.replace('<dir prefix="cwd">fonts</dir>', f'<dir>{fonts_dir}</dir>')
+    base = os.path.join(cache_dir(), 'camoufox-fontconfig')
+    os.makedirs(base, exist_ok=True)
+    ans = os.path.join(base, f'fonts-{version}-{target_os}.conf')
+    if not os.path.exists(ans):
+        # Write atomically, several processes can be doing this at once
+        fd, tmp = tempfile.mkstemp(dir=base, suffix='.conf')
+        try:
+            with open(fd, 'w') as f:
+                f.write(conf)
+            os.replace(tmp, ans)
+        except BaseException:
+            os.remove(tmp)
+            raise
+    return ans
+
+
+# }}}
+
+
+def generate_fingerprint(target_os: str, window: tuple[int, int] | None = None) -> dict[str, Any]:
+    """Generate a random, internally consistent, fingerprint for target_os using
+    browserforge and return it as a camoufox config."""
+    browserforge_data()  # ensure the data files are present and up to date first
+    from browserforge.fingerprints import FingerprintGenerator
+
+    fingerprint = FingerprintGenerator(browser='firefox', os=(target_os,)).generate()
+    from dataclasses import asdict
+
+    data = asdict(fingerprint)
+    if window is not None:
+        screen = data['screen']
+        outer_width, outer_height = window
+        screen['screenX'] = (screen.get('screenX') or 0) + (screen['width'] - outer_width) // 2
+        screen['screenY'] = (screen['height'] - outer_height) // 2
+        if screen.get('innerWidth'):
+            screen['innerWidth'] = max(outer_width - screen['outerWidth'] + screen['innerWidth'], 0)
+        if screen.get('innerHeight'):
+            screen['innerHeight'] = max(outer_height - screen['outerHeight'] + screen['innerHeight'], 0)
+        screen['outerWidth'], screen['outerHeight'] = outer_width, outer_height
+    return data
+
+
+@lru_cache(maxsize=2)
+def config_property_types(resource_dir: str) -> dict[str, str]:
+    """The config properties the installed browser understands, mapped to their types."""
+    with open(os.path.join(resource_dir, 'properties.json'), 'rb') as f:
+        return {entry['property']: entry['type'] for entry in json.loads(f.read())}
+
+
+def value_has_type(value: Any, expected: str) -> bool:
+    match expected:
+        case 'str':
+            return isinstance(value, str)
+        case 'bool':
+            return isinstance(value, bool)
+        case 'int' | 'uint':
+            ok = (isinstance(value, int) and not isinstance(value, bool)) or (isinstance(value, float) and value.is_integer())
+            return ok and (expected == 'int' or value >= 0)
+        case 'double':
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        case 'array':
+            return isinstance(value, list)
+        case 'dict':
+            return isinstance(value, dict)
+    return False
+
+
+def validate_config(config: Mapping[str, Any], resource_dir: str) -> None:
+    """Check that config only contains properties the installed browser knows
+    about, with values of the right type. Unknown properties are dropped by the
+    browser, so they are merely reported, a wrongly typed value is an error."""
+    types = config_property_types(resource_dir)
+    for key, value in config.items():
+        expected = types.get(key)
+        if expected is None:
+            debug(f'Ignoring the camoufox config property {key} which is not supported by this version of the browser')
+        elif not value_has_type(value, expected):
+            raise ValueError(f'The camoufox config property {key} must be of type {expected} not {type(value).__name__}')
+
+
+def generate_config(
+    resource_dir: str,
+    version: str,
+    *,
+    target_os: str = '',
+    window: tuple[int, int] | None = None,
+    fonts: Sequence[str] | None = None,
+    locale: str | Sequence[str] = '',
+    humanize: bool | float = False,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the camoufox config used to spoof the browser fingerprint.
+
+    :param resource_dir: the directory containing the browser's data files
+    :param version: the version of the installed browser
+    :param target_os: the OS to impersonate, defaults to the OS we are running on
+    :param window: a fixed (width, height) for the browser window instead of a random one
+    :param fonts: the font families to report, defaults to a random subset of the
+        fonts camoufox bundles for target_os
+    :param locale: the locale(s) to report, the first is used for the Intl API
+    :param humanize: move the mouse cursor the way a human would, optionally
+        taking the maximum duration of a movement in seconds
+    :param extra: config properties that override the generated ones
+    """
+    target_os = check_valid_os(target_os or current_os())
+    ff_version = version.split('.', 1)[0]
+    config: dict[str, Any] = {}
+    fingerprint = generate_fingerprint(target_os, window)
+    cast_to_properties(config, BROWSERFORGE_MAP, fingerprint, ff_version)
+    set_screen_y(config, fingerprint['screen'])
+    fix_navigator_arch(config, target_os)
+    clamp_window_dimensions(config)
+    set_media_devices_defaults(config)
+
+    # A browser that has never been used before is unusual, give it some history
+    config['window.history.length'] = random.randrange(1, 6)
+
+    if fonts is None:
+        available = font_families(resource_dir, version, target_os)
+        if available:
+            config['fonts'] = random_font_subset(available, target_os)
+    else:
+        config['fonts'] = list(fonts)
+
+    if locale:
+        languages = (locale,) if isinstance(locale, str) else tuple(locale)
+        if languages:
+            primary = languages[0].replace('_', '-')
+            language, _, region = primary.partition('-')
+            config['locale:language'] = language
+            if region:
+                config['locale:region'] = region
+            config['locale:all'] = ','.join(x.replace('_', '-') for x in languages)
+
+    if humanize:
+        config['humanize'] = True
+        if isinstance(humanize, (int, float)) and not isinstance(humanize, bool):
+            config['humanize:maxTime'] = float(humanize)
+
+    # Randomize the per-launch noise seeds. They must differ between runs or the
+    # audio/canvas/font measurements they perturb become a stable identifier.
+    for key in ('fonts:spacing_seed', 'audio:seed', 'canvas:seed'):
+        config[key] = random.randrange(1, 4_294_967_296)
+
+    if extra:
+        config.update(extra)
+    validate_config(config, resource_dir)
+    return config
+
+
+def config_environment(config: Mapping[str, Any]) -> dict[str, str]:
+    """Encode config into the environment variables camoufox reads it from.
+
+    The config is passed as JSON split over as many CAMOU_CONFIG_n variables as
+    are needed to stay under the platform's limit on the size of a single
+    environment variable.
+    """
+    raw = json.dumps(config, separators=(',', ':'))
+    chunk_size = 2047 if iswindows else 32767
+    return {f'CAMOU_CONFIG_{i + 1}': raw[pos : pos + chunk_size] for i, pos in enumerate(range(0, len(raw), chunk_size))}
+
+
+# }}}
+
+# Talking to the browser process {{{
+
+
+def write_all(fd: int, data: bytes) -> None:
+    while data:
+        data = data[os.write(fd, data) :]
+
+
+def close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class Transport:
+    """A NUL delimited JSON message channel to the browser process.
+
+    The pipes the browser uses are ordinary blocking pipes, and on Windows they
+    cannot be used with asyncio at all, so they are serviced by a pair of
+    threads that hand messages to and from the event loop.
+    """
+
+    def __init__(self, read_fd: int, write_fd: int, loop: asyncio.AbstractEventLoop, on_message: Callable[[bytes], None], on_close: Callable[[], None]):
+        self.read_fd, self.write_fd = read_fd, write_fd
+        self.loop, self.on_message, self.on_close = loop, on_message, on_close
+        self.write_queue: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+        self.closed = False
+        self.reader = threading.Thread(target=self.read_loop, name='CamoufoxRead', daemon=True)
+        self.writer = threading.Thread(target=self.write_loop, name='CamoufoxWrite', daemon=True)
+        self.reader.start()
+        self.writer.start()
+
+    def call_in_loop(self, func: Callable[..., Any], *args: Any) -> None:
+        try:
+            self.loop.call_soon_threadsafe(func, *args)
+        except RuntimeError:
+            pass  # the loop has been closed, nothing left to deliver messages to
+
+    def read_loop(self) -> None:
+        buf = bytearray()
+        while True:
+            try:
+                data = os.read(self.read_fd, 1024 * 1024)
+            except OSError:
+                break
+            if not data:
+                break
+            buf.extend(data)
+            while (pos := buf.find(b'\0')) != -1:
+                message = bytes(buf[:pos])
+                del buf[: pos + 1]
+                self.call_in_loop(self.on_message, message)
+        self.call_in_loop(self.on_close)
+
+    def write_loop(self) -> None:
+        while True:
+            item = self.write_queue.get()
+            if item is None:
+                break
+            try:
+                write_all(self.write_fd, item)
+            except OSError:
+                break  # the browser has gone away, the reader will notice
+
+    def send(self, message: Mapping[str, Any]) -> None:
+        if self.closed:
+            raise BrowserClosedError('The connection to the browser has been closed')
+        self.write_queue.put(json.dumps(message, separators=(',', ':')).encode('utf-8') + b'\0')
+
+    def close(self) -> None:
+        """Close the command pipe. The browser treats this as a request to exit."""
+        if self.closed:
+            return
+        self.closed = True
+        self.write_queue.put(None)
+        self.writer.join(timeout=5)
+        close_fd(self.write_fd)
+
+    def shutdown(self) -> None:
+        """Release both pipes. Only safe once the browser has exited, as that is
+        what makes the reader thread see end of file and stop."""
+        self.close()
+        self.reader.join(timeout=5)
+        close_fd(self.read_fd)
+
+
+class Process:
+    """The running browser process, and the pipes used to talk to it."""
+
+    def __init__(self, pid_or_handle: int, read_fd: int, write_fd: int, log_path: str):
+        self.read_fd, self.write_fd, self.log_path = read_fd, write_fd, log_path
+        self.returncode: int | None = None
+        if iswindows:
+            self.handle = pid_or_handle
+            self.pid = 0
+        else:
+            self.pid = pid_or_handle
+
+    def poll(self) -> int | None:
+        raise NotImplementedError
+
+    def wait(self, timeout: float) -> int | None:
+        raise NotImplementedError
+
+    def kill(self) -> None:
+        raise NotImplementedError
+
+    def cleanup(self, close_pipes: bool) -> None:
+        """Release the operating system resources this process still owns. The
+        pipes belong to the Transport once one has been created for them."""
+        if close_pipes:
+            close_fd(self.read_fd)
+            close_fd(self.write_fd)
+
+    def log_tail(self, num_lines: int = 30) -> str:
+        try:
+            with open(self.log_path, errors='replace') as f:
+                return ''.join(f.readlines()[-num_lines:])
+        except OSError:
+            return ''
+
+
+class PosixProcess(Process):
+    def poll(self) -> int | None:
+        if self.returncode is None:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = -1
+            else:
+                if pid:
+                    self.returncode = status
+        return self.returncode
+
+    def wait(self, timeout: float) -> int | None:
+        deadline = time.monotonic() + timeout
+        while self.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self.returncode
+
+    def kill(self) -> None:
+        import signal
+
+        if self.poll() is None:
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    os.kill(self.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            self.wait(5)
+
+
+def reserve_high_fd(fd: int, minimum: int = 5) -> int:
+    """Move fd so that it does not collide with the descriptors we have to set up
+    in the child, returning the new descriptor."""
+    if fd >= minimum:
+        return fd
+    temporary = []
+    try:
+        while True:
+            new = os.dup(fd)
+            if new >= minimum:
+                os.close(fd)
+                return new
+            temporary.append(new)
+    finally:
+        for x in temporary:
+            os.close(x)
+
+
+def spawn_posix(argv: Sequence[str], env: Mapping[str, str], log_path: str) -> PosixProcess:
+    """Start the browser with its command pipe on fd 3 and its response pipe on fd 4."""
+    command_read, command_write = os.pipe()
+    response_read, response_write = os.pipe()
+    command_read, response_write = reserve_high_fd(command_read), reserve_high_fd(response_write)
+    command_write, response_read = reserve_high_fd(command_write), reserve_high_fd(response_read)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        pid = os.posix_spawn(
+            argv[0],
+            list(argv),
+            dict(env),
+            file_actions=[
+                (os.POSIX_SPAWN_DUP2, command_read, 3),
+                (os.POSIX_SPAWN_DUP2, response_write, 4),
+                (os.POSIX_SPAWN_DUP2, log_fd, 1),
+                (os.POSIX_SPAWN_DUP2, log_fd, 2),
+            ],
+            # Put the browser in its own process group so that, for example, a
+            # Ctrl-C in a terminal does not kill it out from under us
+            setpgroup=0,
+        )
+    except BaseException:
+        for fd in (command_write, response_read):
+            os.close(fd)
+        raise
+    finally:
+        for fd in (command_read, response_write, log_fd):
+            os.close(fd)
+    return PosixProcess(pid, response_read, command_write, log_path)
+
+
+# The block of inherited C runtime file descriptors is built outside the Windows
+# only section below so that its layout can be tested on any platform
+CRT_HANDLE_SIZE = 8 if struct.calcsize('P') == 8 else 4
+# msvcrt file descriptor flags, from the ioinfo structure in the CRT sources
+FOPEN, FPIPE, FDEV = 0x01, 0x08, 0x40
+
+
+def crt_handle_block(handles: Sequence[int], flags: Sequence[int], handle_size: int = CRT_HANDLE_SIZE) -> bytes:
+    """Build the block of inherited file descriptors that the Microsoft C runtime
+    reads out of STARTUPINFO.lpReserved2.
+
+    The browser finds its pipes with _get_osfhandle(3) and _get_osfhandle(4), so
+    they have to be handed over as C runtime file descriptors, which Python's
+    subprocess module cannot do. The layout is a count, then one flags byte per
+    descriptor, then one handle per descriptor.
+    """
+    if len(handles) != len(flags):
+        raise ValueError('There must be exactly one flags byte per handle')
+    fmt = '<Q' if handle_size == 8 else '<I'
+    invalid = 2 ** (8 * handle_size) - 1  # INVALID_HANDLE_VALUE, that is, -1
+    ans = bytearray(struct.pack('<I', len(handles)))
+    ans += bytes(flags)
+    for handle in handles:
+        ans += struct.pack(fmt, invalid if handle < 0 else handle)
+    return bytes(ans)
+
+
+if iswindows:  # {{{
+    import ctypes
+    import msvcrt
+    import subprocess
+    from ctypes import wintypes
+
+    STARTF_USESTDHANDLES = 0x00000100
+    CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    STILL_ACTIVE = 259
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ('cb', wintypes.DWORD),
+            ('lpReserved', wintypes.LPWSTR),
+            ('lpDesktop', wintypes.LPWSTR),
+            ('lpTitle', wintypes.LPWSTR),
+            ('dwX', wintypes.DWORD),
+            ('dwY', wintypes.DWORD),
+            ('dwXSize', wintypes.DWORD),
+            ('dwYSize', wintypes.DWORD),
+            ('dwXCountChars', wintypes.DWORD),
+            ('dwYCountChars', wintypes.DWORD),
+            ('dwFillAttribute', wintypes.DWORD),
+            ('dwFlags', wintypes.DWORD),
+            ('wShowWindow', wintypes.WORD),
+            ('cbReserved2', wintypes.WORD),
+            ('lpReserved2', ctypes.POINTER(ctypes.c_byte)),
+            ('hStdInput', wintypes.HANDLE),
+            ('hStdOutput', wintypes.HANDLE),
+            ('hStdError', wintypes.HANDLE),
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ('hProcess', wintypes.HANDLE),
+            ('hThread', wintypes.HANDLE),
+            ('dwProcessId', wintypes.DWORD),
+            ('dwThreadId', wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.CreateProcessW.restype = wintypes.BOOL
+    kernel32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.BOOL,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFOW),
+        ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class WindowsProcess(Process):
+        def poll(self) -> int | None:
+            if self.returncode is None and self.handle:
+                code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(wintypes.HANDLE(self.handle), ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                    self.returncode = code.value
+            return self.returncode
+
+        def wait(self, timeout: float) -> int | None:
+            if self.returncode is None and self.handle:
+                kernel32.WaitForSingleObject(wintypes.HANDLE(self.handle), max(int(timeout * 1000), 0))
+            return self.poll()
+
+        def kill(self) -> None:
+            if self.poll() is None and self.handle:
+                kernel32.TerminateProcess(wintypes.HANDLE(self.handle), 1)
+                self.wait(5)
+
+        def cleanup(self, close_pipes: bool) -> None:
+            super().cleanup(close_pipes)
+            if self.handle:
+                kernel32.CloseHandle(wintypes.HANDLE(self.handle))
+                self.handle = 0
+
+    def spawn_windows(argv: Sequence[str], env: Mapping[str, str], log_path: str) -> WindowsProcess:
+        """Start the browser with its command pipe on fd 3 and its response pipe on fd 4."""
+        command_read, command_write = os.pipe()
+        response_read, response_write = os.pipe()
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        null_fd = os.open(os.devnull, os.O_RDONLY)
+        pi = PROCESS_INFORMATION()
+        try:
+            null_handle, log_handle = msvcrt.get_osfhandle(null_fd), msvcrt.get_osfhandle(log_fd)
+            child_read, child_write = msvcrt.get_osfhandle(command_read), msvcrt.get_osfhandle(response_write)
+            for handle in (null_handle, log_handle, child_read, child_write):
+                os.set_handle_inheritable(handle, True)
+            block = crt_handle_block(
+                (null_handle, log_handle, log_handle, child_read, child_write),
+                (FOPEN | FDEV, FOPEN | FDEV, FOPEN | FDEV, FOPEN | FPIPE, FOPEN | FPIPE),
+            )
+            buf = (ctypes.c_byte * len(block)).from_buffer_copy(block)
+            si = STARTUPINFOW()
+            si.cb = ctypes.sizeof(STARTUPINFOW)
+            si.dwFlags = STARTF_USESTDHANDLES
+            si.hStdInput, si.hStdOutput, si.hStdError = null_handle, log_handle, log_handle
+            si.cbReserved2 = len(block)
+            si.lpReserved2 = ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte))
+            # The browser also accepts the pipes through the environment, set
+            # them so that it works whether or not the Windows launcher process
+            # is in play
+            env = dict(env, PW_PIPE_READ=str(child_read), PW_PIPE_WRITE=str(child_write))
+            environment = ctypes.create_unicode_buffer(''.join(f'{k}={v}\0' for k, v in env.items()) + '\0')
+            if not kernel32.CreateProcessW(
+                argv[0],
+                ctypes.create_unicode_buffer(subprocess.list2cmdline(argv)),
+                None,
+                None,
+                True,  # the child inherits the handles marked inheritable above
+                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP,
+                ctypes.cast(environment, ctypes.c_void_p),
+                None,
+                ctypes.byref(si),
+                ctypes.byref(pi),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            kernel32.CloseHandle(pi.hThread)
+        except BaseException:
+            for fd in (command_write, response_read):
+                close_fd(fd)
+            raise
+        finally:
+            # The child has its own copies of these now
+            for fd in (command_read, response_write, log_fd, null_fd):
+                close_fd(fd)
+        return WindowsProcess(pi.hProcess, response_read, command_write, log_path)
+# }}}
+
+
+def spawn(argv: Sequence[str], env: Mapping[str, str], log_path: str) -> Process:
+    if iswindows:
+        return spawn_windows(argv, env, log_path)  # type: ignore[name-defined]
+    return spawn_posix(argv, env, log_path)
+
+
+# }}}
+
+# The protocol {{{
+
+
+class Connection:
+    """Dispatches Juggler protocol messages to and from the browser."""
+
+    def __init__(self) -> None:
+        self.transport: Transport | None = None
+        self.message_id = 0
+        self.replies: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.event_handlers: dict[str, Callable[[str, dict[str, Any]], None]] = {}
+        self.root_handler: Callable[[str, dict[str, Any]], None] | None = None
+        self.closed_error: BrowserClosedError | None = None
+        self.on_closed: Callable[[], None] | None = None
+
+    def start(self, process: Process, loop: asyncio.AbstractEventLoop) -> None:
+        self.transport = Transport(process.read_fd, process.write_fd, loop, self.message_received, self.connection_lost)
+
+    def message_received(self, raw: bytes) -> None:
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            debug(f'Ignoring unparseable message from the browser: {raw[:256]!r}')
+            return
+        if (message_id := message.get('id')) is not None:
+            if (future := self.replies.pop(message_id, None)) is not None and not future.done():
+                future.set_result(message)
+            return
+        method, params = message.get('method', ''), message.get('params') or {}
+        session_id = message.get('sessionId')
+        if session_id:
+            if (handler := self.event_handlers.get(session_id)) is not None:
+                handler(method, params)
+        elif self.root_handler is not None:
+            self.root_handler(method, params)
+
+    def connection_lost(self) -> None:
+        self.closed_error = BrowserClosedError('The browser process exited')
+        for future in self.replies.values():
+            if not future.done():
+                future.set_exception(self.closed_error)
+        self.replies.clear()
+        if self.on_closed is not None:
+            self.on_closed()
+
+    def send_nowait(self, method: str, params: Mapping[str, Any] | None = None, session_id: str = '') -> int:
+        if self.closed_error is not None:
+            raise self.closed_error
+        assert self.transport is not None
+        self.message_id += 1
+        message: dict[str, Any] = {'id': self.message_id, 'method': method, 'params': params or {}}
+        if session_id:
+            message['sessionId'] = session_id
+        self.transport.send(message)
+        return self.message_id
+
+    async def send(self, method: str, params: Mapping[str, Any] | None = None, session_id: str = '', timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        message_id = self.send_nowait(method, params, session_id)
+        self.replies[message_id] = future
+        try:
+            async with asyncio.timeout(timeout):
+                message = await future
+        except TimeoutError:
+            self.replies.pop(message_id, None)
+            raise TimeoutExceeded(f'{method} did not complete in {timeout} seconds')
+        if (error := message.get('error')) is not None:
+            raise ProtocolError(method, error.get('message') or 'Unknown error', error.get('data') or '')
+        # A method with no return value produces a message with no result at all
+        return message.get('result') or {}
+
+    def close(self) -> None:
+        if self.transport is not None:
+            self.transport.close()
+
+
+class Event(NamedTuple):
+    method: str
+    params: dict[str, Any]
+
+
+class EventWaiter:
+    """Waits for a protocol event matching a predicate."""
+
+    def __init__(self) -> None:
+        self.waiters: list[tuple[Callable[[str, Mapping[str, Any]], bool], asyncio.Future[Event]]] = []
+
+    def dispatch(self, method: str, params: dict[str, Any]) -> None:
+        for entry in tuple(self.waiters):
+            predicate, future = entry
+            if future.done():
+                self.waiters.remove(entry)
+                continue
+            try:
+                matched = predicate(method, params)
+            except Exception:
+                matched = False
+            if matched:
+                future.set_result(Event(method, params))
+                self.waiters.remove(entry)
+
+    def expect(self, predicate: Callable[[str, Mapping[str, Any]], bool]) -> asyncio.Future[Event]:
+        future: asyncio.Future[Event] = asyncio.get_running_loop().create_future()
+        self.waiters.append((predicate, future))
+        return future
+
+    def abort(self, error: Exception) -> None:
+        for _, future in self.waiters:
+            if not future.done():
+                future.set_exception(error)
+        self.waiters.clear()
+
+
+async def wait_for(future: asyncio.Future[Any], timeout: float, what: str) -> Any:
+    try:
+        async with asyncio.timeout(timeout):
+            return await future
+    except TimeoutError:
+        future.cancel()
+        raise TimeoutExceeded(f'Timed out after {timeout} seconds waiting for {what}')
+
+
+# }}}
+
+# JavaScript run inside pages {{{
+
+REMOVE_JS = '''(selector) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) node.remove();
+    return nodes.length;
+}'''
+
+SET_ATTRIBUTE_JS = '''(selector, name, value) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) node.setAttribute(name, value);
+    return nodes.length;
+}'''
+
+DELETE_ATTRIBUTE_JS = '''(selector, name) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) node.removeAttribute(name);
+    return nodes.length;
+}'''
+
+APPEND_CHILD_JS = '''(selector, tag, attributes, text) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) {
+        const child = node.ownerDocument.createElement(tag);
+        for (const name of Object.keys(attributes)) child.setAttribute(name, attributes[name]);
+        if (text) child.appendChild(node.ownerDocument.createTextNode(text));
+        node.appendChild(child);
+    }
+    return nodes.length;
+}'''
+
+INSERT_HTML_JS = '''(selector, html, position) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) node.insertAdjacentHTML(position, html);
+    return nodes.length;
+}'''
+
+SET_TEXT_JS = '''(selector, text) => {
+    const nodes = document.querySelectorAll(selector);
+    for (const node of nodes) node.textContent = text;
+    return nodes.length;
+}'''
+
+WAIT_FOR_SELECTOR_JS = '''(selector, timeout, visible) => new Promise((resolve) => {
+    const match = () => {
+        for (const el of document.querySelectorAll(selector)) {
+            if (!visible) return el;
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden') return el;
+        }
+        return null;
+    };
+    const found = match();
+    if (found) { resolve(found); return; }
+    let observer = null, timer = null;
+    const done = (value) => {
+        if (observer) observer.disconnect();
+        if (timer !== null) clearTimeout(timer);
+        resolve(value);
+    };
+    observer = new MutationObserver(() => { const el = match(); if (el) done(el); });
+    observer.observe(document.documentElement, {childList: true, subtree: true, attributes: true});
+    timer = setTimeout(() => done(null), timeout);
+    const again = match();
+    if (again) done(again);
+})'''
+
+# Scripts run behind Xray wrappers, which forbid reading the contents of a typed
+# array, so the bytes are turned into base64 by the browser itself rather than by
+# walking a Uint8Array. It has to be an async function because the promise
+# fetch() hands out is invisible to the browser, see Page.evaluate().
+FETCH_JS = '''async (url) => {
+    const response = await fetch(url, {credentials: 'include'});
+    const blob = await response.blob();
+    const dataURL = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+    return {
+        status: response.status,
+        contentType: response.headers.get('content-type') || '',
+        base64: dataURL.slice(dataURL.indexOf(',') + 1),
+    };
+}'''
+
+# }}}
+
+
+class Resource(NamedTuple):
+    """The bytes of something the page loaded, such as an image."""
+
+    url: str
+    content_type: str
+    data: bytes
+
+
+class Element:
+    """A handle to a DOM node in a page."""
+
+    def __init__(self, page: Page, object_id: str):
+        self.page, self.object_id = page, object_id
+        self.disposed = False
+
+    def __repr__(self) -> str:
+        return f'<Element {self.object_id}{" (disposed)" if self.disposed else ""}>'
+
+    async def call(self, function_declaration: str, *args: Any, by_value: bool = True) -> Any:
+        """Call a JavaScript function with this element as its first argument."""
+        if self.disposed:
+            raise Error('This element handle has been disposed')
+        return await self.page.call_with_handles(function_declaration, [{'objectId': self.object_id}, *[{'value': a} for a in args]], by_value=by_value)
+
+    async def html(self) -> str:
+        return await self.call('(node) => node.outerHTML')
+
+    async def inner_html(self) -> str:
+        return await self.call('(node) => node.innerHTML')
+
+    async def text(self) -> str:
+        return await self.call('(node) => node.textContent')
+
+    async def attribute(self, name: str) -> str | None:
+        return await self.call('(node, name) => node.getAttribute(name)', name)
+
+    async def attributes(self) -> dict[str, str]:
+        return await self.call('(node) => Object.fromEntries(Array.from(node.attributes).map((a) => [a.name, a.value]))')
+
+    async def set_attribute(self, name: str, value: str) -> None:
+        await self.call('(node, name, value) => node.setAttribute(name, value)', name, value)
+
+    async def delete_attribute(self, name: str) -> None:
+        await self.call('(node, name) => node.removeAttribute(name)', name)
+
+    async def set_text(self, text: str) -> None:
+        await self.call('(node, text) => { node.textContent = text; }', text)
+
+    async def append_child(self, tag: str, attributes: Mapping[str, str] | None = None, text: str = '') -> None:
+        await self.call(
+            '''(node, tag, attributes, text) => {
+                const child = node.ownerDocument.createElement(tag);
+                for (const name of Object.keys(attributes)) child.setAttribute(name, attributes[name]);
+                if (text) child.appendChild(node.ownerDocument.createTextNode(text));
+                node.appendChild(child);
+            }''',
+            tag,
+            dict(attributes or {}),
+            text,
+        )
+
+    async def insert_html(self, html: str, position: str = 'beforeend') -> None:
+        await self.call('(node, html, position) => node.insertAdjacentHTML(position, html)', html, position)
+
+    async def remove(self) -> None:
+        await self.call('(node) => node.remove()')
+        await self.dispose()
+
+    async def find(self, css_selector: str) -> Element | None:
+        handle = await self.call('(node, selector) => node.querySelector(selector)', css_selector, by_value=False)
+        return handle
+
+    async def dispose(self) -> None:
+        if self.disposed:
+            return
+        self.disposed = True
+        try:
+            await self.page.connection.send(
+                'Runtime.disposeObject', {'executionContextId': self.page.execution_context, 'objectId': self.object_id}, self.page.session_id
+            )
+        except Error, KeyError:
+            pass  # the context is already gone, so is the object
+
+
+class Page:
+    """A single tab in the browser."""
+
+    def __init__(self, browser: Browser, session_id: str, target_id: str, opener_id: str = ''):
+        self.browser, self.session_id, self.target_id, self.opener_id = browser, session_id, target_id, opener_id
+        self.connection = browser.connection
+        self.main_frame = ''
+        self.url = 'about:blank'
+        self.closed = False
+        self.events = EventWaiter()
+        self.ready = asyncio.Event()
+        # frame id -> id of the execution context for the main JavaScript world
+        self.contexts: dict[str, str] = {}
+        self.lifecycle: dict[str, set[str]] = {}
+        # request id -> url and url -> request id, for retrieving response bodies
+        self.request_urls: dict[str, str] = {}
+        self.requests_by_url: dict[str, str] = {}
+        self.content_types: dict[str, str] = {}
+
+    def __repr__(self) -> str:
+        return f'<Page {self.target_id} {self.url}{" (closed)" if self.closed else ""}>'
+
+    # Event handling {{{
+
+    def handle_event(self, method: str, params: dict[str, Any]) -> None:
+        match method:
+            case 'Page.ready':
+                self.ready.set()
+            case 'Page.frameAttached':
+                if not params.get('parentFrameId'):
+                    self.main_frame = params['frameId']
+            case 'Page.frameDetached':
+                self.contexts.pop(params['frameId'], None)
+                self.lifecycle.pop(params['frameId'], None)
+            case 'Page.navigationCommitted':
+                frame_id = params['frameId']
+                self.lifecycle[frame_id] = set()
+                if frame_id == self.main_frame:
+                    self.url = params.get('url') or self.url
+            case 'Page.eventFired':
+                self.lifecycle.setdefault(params['frameId'], set()).add(params['name'])
+            case 'Page.sameDocumentNavigation':
+                if params['frameId'] == self.main_frame:
+                    self.url = params.get('url') or self.url
+            case 'Page.dialogOpened':
+                # Nothing is driving the browser interactively, so a dialog left
+                # open would block the page forever
+                self.connection.send_nowait('Page.handleDialog', {'dialogId': params['dialogId'], 'accept': True}, self.session_id)
+            case 'Page.crashed':
+                self.events.abort(BrowserClosedError('The page crashed'))
+            case 'Runtime.executionContextCreated':
+                aux = params.get('auxData') or {}
+                frame_id = aux.get('frameId')
+                if frame_id and not aux.get('name'):  # the main world, not an isolated one
+                    self.contexts[frame_id] = params['executionContextId']
+            case 'Runtime.executionContextDestroyed':
+                for frame_id, context in tuple(self.contexts.items()):
+                    if context == params['executionContextId']:
+                        del self.contexts[frame_id]
+            case 'Runtime.executionContextsCleared':
+                self.contexts.clear()
+            case 'Network.requestWillBeSent':
+                self.track_request(params['requestId'], params['url'])
+            case 'Network.responseReceived':
+                for header in params.get('headers') or ():
+                    if header.get('name', '').lower() == 'content-type':
+                        self.content_types[params['requestId']] = header.get('value') or ''
+        self.events.dispatch(method, params)
+
+    def track_request(self, request_id: str, url: str) -> None:
+        if len(self.request_urls) >= MAX_TRACKED_REQUESTS:
+            oldest = next(iter(self.request_urls))
+            old_url = self.request_urls.pop(oldest)
+            self.content_types.pop(oldest, None)
+            if self.requests_by_url.get(old_url) == oldest:
+                del self.requests_by_url[old_url]
+        self.request_urls[request_id] = url
+        self.requests_by_url[url] = request_id
+
+    def detached(self) -> None:
+        self.closed = True
+        self.events.abort(BrowserClosedError('The page was closed'))
+        self.ready.set()
+
+    # }}}
+
+    async def send(self, method: str, params: Mapping[str, Any] | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+        if self.closed:
+            raise BrowserClosedError('This page has been closed')
+        return await self.connection.send(method, params, self.session_id, timeout)
+
+    async def wait_until_ready(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        try:
+            async with asyncio.timeout(timeout):
+                await self.ready.wait()
+        except TimeoutError:
+            raise TimeoutExceeded(f'The page was not ready within {timeout} seconds')
+        if not self.main_frame:
+            raise Error('The page became ready without reporting a main frame')
+
+    # Evaluating JavaScript {{{
+
+    @property
+    def execution_context(self) -> str:
+        try:
+            return self.contexts[self.main_frame]
+        except KeyError:
+            raise Error('The page has no JavaScript execution context, it is probably still navigating')
+
+    async def wait_for_execution_context(self, timeout: float = DEFAULT_TIMEOUT) -> str:
+        """The execution context of the main frame, waiting for it to be created
+        if the page has only just navigated."""
+        if self.main_frame in self.contexts:
+            return self.contexts[self.main_frame]
+
+        def is_our_context(method: str, params: Mapping[str, Any]) -> bool:
+            return method == 'Runtime.executionContextCreated' and (params.get('auxData') or {}).get('frameId') == self.main_frame
+
+        await wait_for(self.events.expect(is_our_context), timeout, 'a JavaScript execution context')
+        return self.execution_context
+
+    def unwrap(self, result: Mapping[str, Any], by_value: bool) -> Any:
+        if (details := result.get('exceptionDetails')) is not None:
+            raise JavaScriptError(details.get('text') or details.get('stack') or repr(details.get('value')))
+        obj = result.get('result') or {}
+        if not by_value:
+            if obj.get('objectId'):
+                return Element(self, obj['objectId'])
+            return obj.get('value')
+        if (unserializable := obj.get('unserializableValue')) is not None:
+            return {'Infinity': float('inf'), '-Infinity': float('-inf'), '-0': -0.0, 'NaN': float('nan')}[unserializable]
+        return obj.get('value')
+
+    async def evaluate(self, expression: str, *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Evaluate a JavaScript expression in the page and return its value.
+
+        Pass by_value=False to get an :class:`Element` handle back for
+        expressions that evaluate to a DOM node.
+
+        If the expression evaluates to a promise, its resolved value is
+        returned, but note that the browser can only see promises created by
+        JavaScript in the page, not the ones handed out by DOM APIs. So
+        ``fetch(url).then(...)`` never completes, while
+        ``(async () => (await fetch(url)).status)()`` works. When in doubt, wrap
+        the expression in an async function.
+        """
+        context = await self.wait_for_execution_context(timeout)
+        result = await self.send('Runtime.evaluate', {'executionContextId': context, 'expression': expression, 'returnByValue': by_value}, timeout)
+        return self.unwrap(result, by_value)
+
+    async def call(self, function_declaration: str, *args: Any, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Call a JavaScript function in the page, passing args to it.
+
+        See :meth:`evaluate` for the caveat about functions that return a
+        promise produced by a DOM API rather than by JavaScript.
+        """
+        return await self.call_with_handles(function_declaration, [{'value': a} for a in args], by_value=by_value, timeout=timeout)
+
+    async def call_with_handles(
+        self, function_declaration: str, args: Sequence[Mapping[str, Any]], *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT
+    ) -> Any:
+        context = await self.wait_for_execution_context(timeout)
+        result = await self.send(
+            'Runtime.callFunction',
+            {'executionContextId': context, 'functionDeclaration': function_declaration, 'args': list(args), 'returnByValue': by_value},
+            timeout,
+        )
+        return self.unwrap(result, by_value)
+
+    # }}}
+
+    # Navigation {{{
+
+    def navigation_finished(self) -> asyncio.Future[Event]:
+        return self.events.expect(
+            lambda method, params: method in ('Page.navigationCommitted', 'Page.navigationAborted') and params.get('frameId') == self.main_frame
+        )
+
+    async def open(self, url: str, *, wait: str = 'load', timeout: float = DEFAULT_TIMEOUT, referer: str = '') -> None:
+        """Load url in this tab.
+
+        :param wait: how much of the load to wait for before returning. One of
+            ``load`` (wait for all sub-resources), ``domcontentloaded`` (wait
+            only for the DOM), ``commit`` (wait only for the server's response
+            to start arriving) or ``none``.
+        """
+        await self.wait_until_ready(timeout)
+        deadline = time.monotonic() + timeout
+        navigate_params: dict[str, Any] = {'frameId': self.main_frame, 'url': url}
+        if referer:
+            navigate_params['referer'] = referer
+        # The waiter has to be in place before the navigation starts, otherwise a
+        # fast load can commit before we get around to listening for it
+        finished = self.navigation_finished()
+        try:
+            result = await self.send('Page.navigate', navigate_params, timeout)
+            navigation_id = result.get('navigationId')
+            if navigation_id is None:  # a fragment only navigation, nothing loads
+                self.url = url
+                return
+            if wait == 'none':
+                return
+            while True:
+                event = await wait_for(finished, max(deadline - time.monotonic(), 0), f'the navigation to {url}')
+                if event.params.get('navigationId') == navigation_id:
+                    break
+                finished = self.navigation_finished()
+        finally:
+            finished.cancel()
+        if event.method == 'Page.navigationAborted':
+            raise Error(f'Navigation to {url} was aborted: {event.params.get("errorText")}')
+        if wait == 'commit':
+            return
+        await self.wait_for_load(wait, max(deadline - time.monotonic(), 0))
+
+    async def wait_for_load(self, state: str = 'load', timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Wait until the main frame has fired the load or DOMContentLoaded event.
+
+        The record of which events have fired is reset every time the frame
+        navigates, so this waits for the *current* document.
+        """
+        name = {'load': 'load', 'domcontentloaded': 'DOMContentLoaded'}.get(state.lower())
+        if name is None:
+            raise ValueError(f'{state} is not a valid state to wait for, use load or domcontentloaded')
+        if name in self.lifecycle.get(self.main_frame, ()):
+            return
+        await wait_for(
+            self.events.expect(lambda method, params: method == 'Page.eventFired' and params['frameId'] == self.main_frame and params['name'] == name),
+            timeout,
+            f'the {name} event',
+        )
+
+    async def reload(self, *, wait: str = 'load', timeout: float = DEFAULT_TIMEOUT) -> None:
+        loaded = self.events.expect(lambda method, params: method == 'Page.navigationCommitted' and params['frameId'] == self.main_frame)
+        await self.send('Page.reload', {}, timeout)
+        await wait_for(loaded, timeout, 'the page to reload')
+        if wait != 'none':
+            await self.wait_for_load(wait, timeout)
+
+    async def go_back(self, *, wait: str = 'load', timeout: float = DEFAULT_TIMEOUT) -> bool:
+        return await self.traverse_history('Page.goBack', wait, timeout)
+
+    async def go_forward(self, *, wait: str = 'load', timeout: float = DEFAULT_TIMEOUT) -> bool:
+        return await self.traverse_history('Page.goForward', wait, timeout)
+
+    async def traverse_history(self, method: str, wait: str, timeout: float) -> bool:
+        committed = self.events.expect(lambda m, params: m == 'Page.navigationCommitted' and params['frameId'] == self.main_frame)
+        result = await self.send(method, {'frameId': self.main_frame}, timeout)
+        if not result.get('success'):
+            committed.cancel()
+            return False
+        await wait_for(committed, timeout, 'the history navigation to commit')
+        if wait != 'none':
+            await self.wait_for_load(wait, timeout)
+        return True
+
+    # }}}
+
+    # Inspecting and modifying the DOM {{{
+
+    async def html(self) -> str:
+        """The current serialized HTML of the page, including any changes made to the DOM."""
+        return await self.evaluate('document.documentElement.outerHTML')
+
+    async def title(self) -> str:
+        return await self.evaluate('document.title')
+
+    async def current_url(self) -> str:
+        return await self.evaluate('location.href')
+
+    async def wait_for_selector(self, css_selector: str, *, timeout: float = DEFAULT_TIMEOUT, visible: bool = False) -> Element:
+        """Wait for an element matching css_selector to appear and return it.
+
+        A mutation observer is used, so this returns as soon as the element
+        appears rather than polling. Pass visible=True to additionally require
+        that the element has a non zero size and is not hidden.
+        """
+        handle = await self.call(WAIT_FOR_SELECTOR_JS, css_selector, int(timeout * 1000), visible, by_value=False, timeout=timeout + 5)
+        if not isinstance(handle, Element):
+            raise TimeoutExceeded(f'No element matching {css_selector!r} appeared within {timeout} seconds')
+        return handle
+
+    async def find(self, css_selector: str) -> Element | None:
+        """The first element matching css_selector, or None."""
+        handle = await self.call('(selector) => document.querySelector(selector)', css_selector, by_value=False)
+        return handle if isinstance(handle, Element) else None
+
+    async def find_all(self, css_selector: str) -> list[Element]:
+        """Every element matching css_selector."""
+        count = await self.call('(selector) => document.querySelectorAll(selector).length', css_selector)
+        ans = []
+        for i in range(int(count)):
+            handle = await self.call('(selector, i) => document.querySelectorAll(selector)[i]', css_selector, i, by_value=False)
+            if isinstance(handle, Element):
+                ans.append(handle)
+        return ans
+
+    async def remove(self, css_selector: str) -> int:
+        """Remove every element matching css_selector, returning how many were removed."""
+        return int(await self.call(REMOVE_JS, css_selector))
+
+    async def set_attribute(self, css_selector: str, name: str, value: str) -> int:
+        """Set an attribute on every element matching css_selector."""
+        return int(await self.call(SET_ATTRIBUTE_JS, css_selector, name, value))
+
+    async def delete_attribute(self, css_selector: str, name: str) -> int:
+        """Remove an attribute from every element matching css_selector."""
+        return int(await self.call(DELETE_ATTRIBUTE_JS, css_selector, name))
+
+    async def append_child(self, css_selector: str, tag: str, attributes: Mapping[str, str] | None = None, text: str = '') -> int:
+        """Append a newly created element to every element matching css_selector."""
+        return int(await self.call(APPEND_CHILD_JS, css_selector, tag, dict(attributes or {}), text))
+
+    async def insert_html(self, css_selector: str, html: str, position: str = 'beforeend') -> int:
+        """Insert a fragment of HTML relative to every element matching css_selector.
+
+        :param position: one of ``beforebegin``, ``afterbegin``, ``beforeend`` or ``afterend``
+        """
+        if position not in ('beforebegin', 'afterbegin', 'beforeend', 'afterend'):
+            raise ValueError(f'{position} is not a valid insert position')
+        return int(await self.call(INSERT_HTML_JS, css_selector, html, position))
+
+    async def set_text(self, css_selector: str, text: str) -> int:
+        """Replace the contents of every element matching css_selector with text."""
+        return int(await self.call(SET_TEXT_JS, css_selector, text))
+
+    # }}}
+
+    # Resources {{{
+
+    def resource_urls(self, pattern: str = '') -> tuple[str, ...]:
+        """The URLs of the resources this page has requested, optionally
+        restricted to those matching the regular expression pattern."""
+        urls = tuple(self.requests_by_url)
+        if pattern:
+            matches = re.compile(pattern).search
+            urls = tuple(x for x in urls if matches(x))
+        return urls
+
+    async def get_resource(self, url: str, *, timeout: float = DEFAULT_TIMEOUT) -> Resource:
+        """The bytes of a resource, such as an image, that this page loaded.
+
+        The body is taken from the browser's own record of the response, so the
+        resource is not fetched a second time. If the browser has already
+        discarded it, it is re-fetched from within the page, which means it is
+        fetched with the page's cookies and referrer.
+        """
+        request_id = self.requests_by_url.get(url)
+        if request_id is not None:
+            try:
+                result = await self.send('Network.getResponseBody', {'requestId': request_id}, timeout)
+            except ProtocolError:
+                result = {}
+            if result.get('base64body') is not None and not result.get('evicted'):
+                return Resource(url, self.content_types.get(request_id, ''), base64.b64decode(result['base64body']))
+        result = await self.call(FETCH_JS, url, timeout=timeout)
+        if not isinstance(result, dict):
+            raise Error(f'Failed to fetch {url} from the page')
+        if not (200 <= int(result.get('status') or 0) < 300):
+            raise Error(f'Fetching {url} from the page failed with HTTP status {result.get("status")}')
+        return Resource(url, result.get('contentType') or '', base64.b64decode(result.get('base64') or ''))
+
+    async def screenshot(self, *, mime_type: str = 'image/png', quality: int = 0, full_page: bool = False) -> bytes:
+        """A screenshot of the page as image data."""
+        if full_page:
+            width, height = await self.evaluate(
+                '[Math.max(document.documentElement.scrollWidth, document.body ? document.body.scrollWidth : 0),'
+                ' Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)]'
+            )
+        else:
+            width, height = await self.evaluate('[window.innerWidth, window.innerHeight]')
+        params: dict[str, Any] = {'mimeType': mime_type, 'clip': {'x': 0, 'y': 0, 'width': width, 'height': height}}
+        if quality:
+            params['quality'] = quality
+        result = await self.send('Page.screenshot', params)
+        return base64.b64decode(result['data'])
+
+    # }}}
+
+    async def close(self) -> None:
+        """Close this tab."""
+        if self.closed:
+            return
+        try:
+            await self.send('Page.close', {'runBeforeUnload': False}, timeout=CLOSE_TIMEOUT)
+        except Error, ProtocolError:
+            pass
+        self.detached()
+
+
+class Browser:
+    """A running Camoufox browser process.
+
+    Use it as an async context manager::
+
+        async with Browser(headless=True) as browser:
+            await browser.page.open('https://example.com')
+
+    :param headless: run without a visible window
+    :param target_os: the operating system to impersonate, defaults to the one we are running on
+    :param locale: the locale(s) to report to pages
+    :param fonts: the font families to report, defaults to a random subset of the bundled ones
+    :param window: a fixed (width, height) for the window instead of a random one
+    :param humanize: move the mouse cursor the way a human would
+    :param block_images: do not load images at all
+    :param block_webrtc: disable WebRTC entirely
+    :param enable_cache: keep previously loaded pages and requests around, using more memory
+    :param proxy: a proxy to route all traffic through, as a dict with the keys
+        ``type`` (one of http, https, socks, socks4), ``host``, ``port`` and
+        optionally ``username``, ``password`` and ``bypass``
+    :param config: camoufox config properties that override the generated ones
+    :param firefox_user_prefs: Firefox preferences to set
+    :param allow_prerelease: use pre-release builds of the browser
+    """
+
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        target_os: str = '',
+        locale: str | Sequence[str] = '',
+        fonts: Sequence[str] | None = None,
+        window: tuple[int, int] | None = None,
+        humanize: bool | float = True,
+        block_images: bool = False,
+        block_webrtc: bool = False,
+        enable_cache: bool = True,
+        proxy: Mapping[str, Any] | None = None,
+        config: Mapping[str, Any] | None = None,
+        firefox_user_prefs: Mapping[str, Any] | None = None,
+        allow_prerelease: bool = False,
+        launch_timeout: float = LAUNCH_TIMEOUT,
+        keep_log: bool = False,
+    ):
+        self.headless, self.target_os = headless, check_valid_os(target_os or current_os())
+        self.locale, self.fonts, self.window, self.humanize = locale, fonts, window, humanize
+        self.block_images, self.block_webrtc, self.enable_cache = block_images, block_webrtc, enable_cache
+        self.proxy, self.extra_config, self.allow_prerelease = proxy, config, allow_prerelease
+        self.extra_user_prefs = firefox_user_prefs
+        self.launch_timeout, self.keep_log = launch_timeout, keep_log
+        self.connection = Connection()
+        self.process: Process | None = None
+        self.profile_dir = ''
+        self.browser_context_id = ''
+        self.config: dict[str, Any] = {}
+        self.version = ''
+        self.pages: dict[str, Page] = {}
+        self.pending_pages: dict[str, asyncio.Future[Page]] = {}
+        self.new_pages: list[Page] = []
+        self.closed = False
+
+    def __repr__(self) -> str:
+        return f'<Camoufox Browser {self.version}{" (closed)" if self.closed else ""}>'
+
+    async def __aenter__(self) -> Browser:
+        await self.launch()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
+
+    # Launching {{{
+
+    def user_prefs(self) -> dict[str, Any]:
+        prefs = dict(BASE_USER_PREFS)
+        if self.enable_cache:
+            prefs.update(CACHE_USER_PREFS)
+        if self.block_images:
+            prefs['permissions.default.image'] = 2
+        if self.block_webrtc:
+            prefs['media.peerconnection.enabled'] = False
+        if self.extra_user_prefs:
+            prefs.update(self.extra_user_prefs)
+        return prefs
+
+    def build_command_line(self, binary: str) -> list[str]:
+        argv = [binary, '-no-remote', '-profile', self.profile_dir, '-juggler-pipe']
+        if self.headless:
+            argv.append('-headless')
+        # -silent stops the browser opening a window of its own, every page is
+        # created explicitly through the protocol instead
+        argv.append('-silent')
+        return argv
+
+    def build_environment(self, resource_dir: str) -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(config_environment(self.config))
+        if not iswindows and not ismacos:
+            # Only Linux needs to be told where the bundled fonts are, on the
+            # other platforms camoufox restricts the font list itself
+            env['FONTCONFIG_FILE'] = fontconfig_path(resource_dir, self.version, self.target_os)
+        env.pop('MOZ_CRASHREPORTER', None)
+        env['MOZ_CRASHREPORTER_DISABLE'] = '1'
+        return env
+
+    async def launch(self) -> None:
+        """Start the browser process and open its first, empty, tab."""
+        if self.process is not None:
+            raise Error('This browser has already been launched')
+        loop = asyncio.get_running_loop()
+        install = await loop.run_in_executor(None, lambda: camoufox_installer(allow_prerelease=self.allow_prerelease))
+        binary, self.version = install.path, install.version
+        resource_dir = camoufox_resource_dir(binary)
+        self.config = await loop.run_in_executor(
+            None,
+            lambda: generate_config(
+                resource_dir,
+                self.version,
+                target_os=self.target_os,
+                window=self.window,
+                fonts=self.fonts,
+                locale=self.locale,
+                humanize=self.humanize,
+                extra=self.extra_config,
+            ),
+        )
+        self.profile_dir = tempfile.mkdtemp(prefix='camoufox-profile-')
+        log_path = os.path.join(self.profile_dir, 'browser-log.txt')
+        env = self.build_environment(resource_dir)
+        self.connection.root_handler = self.handle_event
+        self.connection.on_closed = self.connection_closed
+        try:
+            self.process = await loop.run_in_executor(None, lambda: spawn(self.build_command_line(binary), env, log_path))
+            self.connection.start(self.process, loop)
+            await self.enable(loop)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def enable(self, loop: asyncio.AbstractEventLoop) -> None:
+        prefs = [{'name': name, 'value': value} for name, value in self.user_prefs().items()]
+        try:
+            await self.connection.send('Browser.enable', {'attachToDefaultContext': False, 'userPrefs': prefs}, timeout=self.launch_timeout)
+        except (TimeoutExceeded, BrowserClosedError) as err:
+            assert self.process is not None
+            raise Error(f'The camoufox browser failed to start: {err}\nBrowser log:\n{self.process.log_tail()}') from err
+        result = await self.connection.send('Browser.createBrowserContext', {'removeOnDetach': True})
+        self.browser_context_id = result['browserContextId']
+        if self.proxy:
+            await self.set_proxy(self.proxy)
+        await self.new_page()
+
+    def handle_event(self, method: str, params: dict[str, Any]) -> None:
+        match method:
+            case 'Browser.attachedToTarget':
+                info = params['targetInfo']
+                page = Page(self, params['sessionId'], info['targetId'], info.get('openerId') or '')
+                self.pages[info['targetId']] = page
+                self.connection.event_handlers[page.session_id] = page.handle_event
+                if (future := self.pending_pages.pop(info['targetId'], None)) is not None and not future.done():
+                    future.set_result(page)
+                else:
+                    self.new_pages.append(page)
+            case 'Browser.detachedFromTarget':
+                page = self.pages.pop(params['targetId'], None)
+                if page is not None:
+                    self.connection.event_handlers.pop(page.session_id, None)
+                    page.detached()
+
+    def connection_closed(self) -> None:
+        self.closed = True
+        error = BrowserClosedError('The browser process exited')
+        for page in self.pages.values():
+            page.detached()
+        for future in self.pending_pages.values():
+            if not future.done():
+                future.set_exception(error)
+        self.pending_pages.clear()
+
+    # }}}
+
+    @property
+    def page(self) -> Page:
+        """The first open tab. There is always at least one until the browser is closed."""
+        for page in self.pages.values():
+            if not page.closed:
+                return page
+        raise Error('The browser has no open pages')
+
+    @property
+    def open_pages(self) -> tuple[Page, ...]:
+        return tuple(page for page in self.pages.values() if not page.closed)
+
+    async def new_page(self, url: str = '', *, wait: str = 'load', timeout: float = DEFAULT_TIMEOUT) -> Page:
+        """Open a new tab, optionally loading url in it.
+
+        Note that the new tab is not brought to the front. Camoufox refuses to
+        activate windows, since doing so is one of the things that gives an
+        automated browser away, so tabs are addressed by their handle rather
+        than by being focused.
+        """
+        result = await self.connection.send('Browser.newPage', {'browserContextId': self.browser_context_id}, timeout=timeout)
+        target_id = result['targetId']
+        page = self.pages.get(target_id)
+        if page is None:
+            future: asyncio.Future[Page] = asyncio.get_running_loop().create_future()
+            self.pending_pages[target_id] = future
+            page = await wait_for(future, timeout, 'the new tab to attach')
+        if page in self.new_pages:
+            self.new_pages.remove(page)
+        await page.wait_until_ready(timeout)
+        if url:
+            await page.open(url, wait=wait, timeout=timeout)
+        return page
+
+    async def popup_pages(self) -> tuple[Page, ...]:
+        """Tabs the pages themselves opened, for example by a link with target=_blank."""
+        ans = tuple(self.new_pages)
+        self.new_pages.clear()
+        return ans
+
+    # Browser wide settings {{{
+
+    async def set_proxy(self, proxy: Mapping[str, Any]) -> None:
+        params = {
+            'browserContextId': self.browser_context_id,
+            'type': proxy.get('type') or 'http',
+            'host': proxy['host'],
+            'port': int(proxy['port']),
+            'bypass': list(proxy.get('bypass') or ()),
+        }
+        for key in ('username', 'password'):
+            if proxy.get(key):
+                params[key] = proxy[key]
+        await self.connection.send('Browser.setContextProxy', params)
+
+    async def set_extra_headers(self, headers: Mapping[str, str]) -> None:
+        await self.connection.send(
+            'Browser.setExtraHTTPHeaders',
+            {'browserContextId': self.browser_context_id, 'headers': [{'name': k, 'value': v} for k, v in headers.items()]},
+        )
+
+    async def cookies(self) -> list[dict[str, Any]]:
+        result = await self.connection.send('Browser.getCookies', {'browserContextId': self.browser_context_id})
+        return result.get('cookies') or []
+
+    async def set_cookies(self, cookies: Iterable[Mapping[str, Any]]) -> None:
+        await self.connection.send('Browser.setCookies', {'browserContextId': self.browser_context_id, 'cookies': [dict(c) for c in cookies]})
+
+    async def clear_cookies(self) -> None:
+        await self.connection.send('Browser.clearCookies', {'browserContextId': self.browser_context_id})
+
+    async def user_agent(self) -> str:
+        result = await self.connection.send('Browser.getInfo')
+        return result.get('userAgent') or ''
+
+    # }}}
+
+    async def close(self) -> None:
+        """Shut the browser down, cleaning up its profile directory."""
+        if self.process is not None:
+            try:
+                # Ask politely first. The browser never answers this, it just
+                # starts exiting, so do not wait for a reply.
+                if not self.closed:
+                    self.connection.send_nowait('Browser.close')
+            except Error, OSError:
+                pass
+            # Closing the command pipe is what actually makes the browser shut
+            # down cleanly, without it the pipe reader thread inside the browser
+            # hangs and the process dies of a segfault instead
+            transport = self.connection.transport
+            self.connection.close()
+            process, self.process = self.process, None
+            exited = await asyncio.get_running_loop().run_in_executor(None, lambda: process.wait(CLOSE_TIMEOUT))
+            if exited is None:
+                debug('The camoufox browser did not exit when asked, killing it')
+                process.kill()
+            if transport is not None:
+                transport.shutdown()
+            process.cleanup(close_pipes=transport is None)
+            if self.keep_log:
+                debug(f'The camoufox browser log is at {process.log_path}')
+        self.closed = True
+        self.pages.clear()
+        if self.profile_dir and not self.keep_log:
+            remove_dir(self.profile_dir)
+            self.profile_dir = ''
+
+
+async def main(args: Sequence[str] = tuple(sys.argv)) -> None:
+    """Load the URLs given on the command line and print out some information
+    about them, for testing this module by hand."""
+    urls = [x for x in args[1:] if not x.startswith('-')]
+    async with Browser(headless='--headful' not in args, keep_log='--keep-log' in args) as browser:
+        print('User agent:', await browser.user_agent())
+        for i, url in enumerate(urls):
+            page = browser.page if i == 0 else await browser.new_page()
+            await page.open(url)
+            print(f'{url}: {await page.title()}')
+            html = await page.html()
+            print(f'  {len(html)} bytes of HTML, {len(page.resource_urls())} resources requested')
+            for resource_url in page.resource_urls(r'\.(png|jpe?g|gif|svg|webp)(\?|$)')[:3]:
+                try:
+                    resource = await page.get_resource(resource_url)
+                except Error as err:
+                    print(f'  failed to get {resource_url}: {err}')
+                else:
+                    print(f'  {len(resource.data)} bytes of {resource.content_type} from {resource_url}')
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
